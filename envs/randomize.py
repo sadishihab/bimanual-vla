@@ -22,6 +22,12 @@ Building the map is a two-stage filter:
     with the approach axis vertical, for every grasp yaw tested.  Props get a
     uniformly random yaw, so requiring all yaws is the correct semantics -- a
     cell that only works at one yaw is not safe to spawn into.
+3.  Each accepted pose must also be *statically holdable*: inverse dynamics at
+    zero velocity and acceleration, rejected if any joint's gravity torque
+    exceeds its actuator's forcerange.  Reaching a pose and holding it are
+    different questions -- the top-down posture throws the arm's mass out
+    horizontally, and the sts3215 servos saturate well inside the kinematic
+    workspace, sagging centimetres below the commanded pose.
 
 Stage 2 costs a couple of minutes per (arm, height), so masks are cached both in
 process and on disk under ``.cache/reach/``, keyed by a hash of the scene
@@ -164,10 +170,11 @@ class ReachMap:
 
     def top_down_ok(self, arm: str, xy: Sequence[float], height: float,
                     *, seed: Optional[np.ndarray] = None) -> Tuple[bool, np.ndarray]:
-        """Whether ``arm`` can reach ``xy`` at ``height`` with the approach axis down.
+        """Whether ``arm`` can reach *and hold* ``xy`` at ``height``, approach axis down.
 
-        Requires a solution at every yaw bin.  Returns ``(ok, q)`` where ``q`` is
-        the last solution found, usable as a warm start for a neighbouring cell.
+        Requires a solution at every yaw bin that both converges and passes the
+        static-torque check.  Returns ``(ok, q)`` where ``q`` is the last solution
+        found, usable as a warm start for a neighbouring cell.
         """
         solver = self._solvers.get(arm)
         if solver is None:
@@ -177,6 +184,7 @@ class ReachMap:
         for k in range(IK_YAW_BINS):
             q, info = solve_top_down(
                 solver, self._data, target, np.pi * k / IK_YAW_BINS, seed=last,
+                accept=solver.holdable,
                 max_iters=IK_MAX_ITERS, pos_tol=IK_POS_TOL, rot_tol=IK_ROT_TOL)
             if not info["converged"]:
                 return False, last if last is not None else q
@@ -246,10 +254,20 @@ def _geometry_hash(model: mujoco.MjModel) -> str:
     h = hashlib.sha1()
     for arr in (model.body_pos, model.body_quat, model.jnt_pos, model.jnt_axis,
                 model.jnt_range, model.jnt_type, model.jnt_bodyid,
-                model.site_pos, model.site_quat, model.site_bodyid):
+                model.site_pos, model.site_quat, model.site_bodyid,
+                model.actuator_forcerange, model.actuator_trnid, model.opt.gravity):
+        h.update(np.ascontiguousarray(arr, dtype=np.float64).tobytes())
+    # Only the arms' own inertial properties matter for the static-hold check --
+    # deliberately not the props, whose masses the randomizer changes per seed.
+    arm_bodies = [b for b in range(model.nbody)
+                  if (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, b) or "")
+                  .startswith(_ARMS)]
+    for arr in (model.body_mass[arm_bodies], model.body_inertia[arm_bodies],
+                model.body_ipos[arm_bodies]):
         h.update(np.ascontiguousarray(arr, dtype=np.float64).tobytes())
     h.update(repr((CELL, GRID_X, GRID_Y, CLOSE_RADIUS, Z_TOLERANCE, SWEEP,
-                   IK_YAW_BINS, IK_POS_TOL, IK_ROT_TOL, IK_MAX_ITERS)).encode())
+                   IK_YAW_BINS, IK_POS_TOL, IK_ROT_TOL, IK_MAX_ITERS,
+                   "torque-feasible-v1")).encode())
     return h.hexdigest()[:16]
 
 

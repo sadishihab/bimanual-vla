@@ -17,7 +17,7 @@ The site itself sits between the jaws, so its position *is* the grasp point.
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Callable, Dict, Optional, Sequence, Tuple
 
 import mujoco
 import numpy as np
@@ -52,7 +52,8 @@ def top_down_mat(open_axis_yaw: float) -> np.ndarray:
 
 
 def solve_top_down(solver: "IKSolver", data: mujoco.MjData, pos: np.ndarray,
-                   yaw: float, **kwargs) -> Tuple[np.ndarray, Dict[str, object]]:
+                   yaw: float, *, accept: Optional[Callable[[np.ndarray], bool]] = None,
+                   **kwargs) -> Tuple[np.ndarray, Dict[str, object]]:
     """Solve for a vertical approach at ``pos``, honouring jaw symmetry.
 
     A parallel gripper grasps identically at ``yaw`` and ``yaw + pi``, but the two
@@ -61,16 +62,22 @@ def solve_top_down(solver: "IKSolver", data: mujoco.MjData, pos: np.ndarray,
     caller wanting a top-down grasp should go through here rather than committing
     to one of the pair.  Returns the converged solution if either works, else
     whichever came closer.
+
+    ``accept`` is an extra predicate a solution must satisfy to count as good --
+    the reach map uses it to demand the pose be statically holdable, not merely
+    reachable.  A candidate that converges but is rejected by ``accept`` does not
+    stop the search: the other side of the pair is still tried.
     """
     best = None
     for candidate in (yaw, yaw + np.pi):
         q, info = solver.solve(data, pos, top_down_mat(candidate), **kwargs)
         info["yaw"] = float(candidate)
-        if info["converged"]:
+        if info["converged"] and (accept is None or accept(q)):
             return q, info
         score = info["pos_err"] + info["rot_err"]
         if best is None or score < best[2]:
             best = (q, info, score)
+    best[1]["converged"] = False        # nothing satisfied both tests
     return best[0], best[1]
 
 
@@ -104,6 +111,18 @@ class IKSolver:
         self.lo = np.asarray(lo)
         self.hi = np.asarray(hi)
 
+        # Peak torque each joint's actuator can produce, for the static-hold check.
+        limits = []
+        for name in self.joints:
+            jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, f"{arm}_{name}")
+            aids = [a for a in range(model.nu)
+                    if model.actuator_trnid[a, 0] == jid
+                    and model.actuator_trntype[a] == mujoco.mjtTrn.mjTRN_JOINT]
+            if not aids:
+                raise ValueError(f"joint {arm}_{name} has no actuator")
+            limits.append(float(np.max(np.abs(model.actuator_forcerange[aids]))))
+        self.forcelimit = np.asarray(limits)
+
         self._scratch = mujoco.MjData(model)
         self._jacp = np.zeros((3, model.nv))
         self._jacr = np.zeros((3, model.nv))
@@ -115,6 +134,33 @@ class IKSolver:
         mujoco.mj_kinematics(self.model, s)
         mujoco.mj_comPos(self.model, s)
         return s.site_xpos[self.site].copy(), s.site_xmat[self.site].reshape(3, 3).copy()
+
+    def static_torque(self, q: np.ndarray) -> np.ndarray:
+        """Torque each arm joint must produce to hold ``q`` motionless under gravity.
+
+        Inverse dynamics at zero velocity and zero acceleration, so ``qfrc_inverse``
+        is exactly the gravity-compensation torque.  Contacts are disabled for the
+        evaluation: the question is what the arm must hold on its own, and leaving
+        them on would both let the arm lean on whatever it happens to intersect
+        (IK ignores collision) and make the answer depend on where the props are,
+        which would defeat caching the map.  Joint friction is ignored too, which
+        is conservative -- it resists motion, so it only ever helps hold a pose.
+        """
+        s = self._scratch
+        s.qpos[self.qadr] = q
+        s.qvel[:] = 0.0
+        s.qacc[:] = 0.0
+        saved = self.model.opt.disableflags
+        self.model.opt.disableflags = int(saved) | int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
+        try:
+            mujoco.mj_inverse(self.model, s)
+        finally:
+            self.model.opt.disableflags = saved
+        return s.qfrc_inverse[self.dofadr].copy()
+
+    def holdable(self, q: np.ndarray) -> bool:
+        """Whether every joint can statically hold ``q`` within its forcerange."""
+        return bool(np.all(np.abs(self.static_torque(q)) <= self.forcelimit))
 
     def solve(self, data: mujoco.MjData, target_pos: np.ndarray,
               target_mat: Optional[np.ndarray] = None, *,
