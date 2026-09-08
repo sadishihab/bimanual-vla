@@ -26,7 +26,8 @@
     <material name="table_leg_mat" rgba="0.30 0.24 0.18 1"/>
     <material name="plate_mat" rgba="0.95 0.95 0.93 1"/>
     <material name="mug_mat" rgba="0.20 0.42 0.75 1"/>
-    <material name="cutlery_mat" rgba="0.78 0.79 0.82 1"/>
+    <material name="spoon_mat" rgba="0.78 0.79 0.82 1"/>
+    <material name="fork_mat" rgba="0.78 0.79 0.82 1"/>
   </asset>
 
   <default>
@@ -88,14 +89,14 @@
 
     <body name="spoon" pos="0.08 -0.28 0.755" childclass="prop">
       <freejoint name="spoon_free"/>
-      <geom name="spoon_handle" type="box" pos="-0.030 0 0" size="0.045 0.006 0.003" material="cutlery_mat"/>
-      <geom name="spoon_bowl" type="ellipsoid" pos="0.028 0 0" size="0.026 0.017 0.005" material="cutlery_mat"/>
+      <geom name="spoon_handle" type="box" pos="-0.030 0 0" size="0.045 0.006 0.003" material="spoon_mat"/>
+      <geom name="spoon_bowl" type="ellipsoid" pos="0.028 0 0" size="0.026 0.017 0.005" material="spoon_mat"/>
     </body>
 
     <body name="fork" pos="0.08 0.28 0.755" childclass="prop">
       <freejoint name="fork_free"/>
-      <geom name="fork_handle" type="box" pos="-0.030 0 0" size="0.045 0.006 0.003" material="cutlery_mat"/>
-      <geom name="fork_head" type="box" pos="0.026 0 0" size="0.026 0.014 0.003" material="cutlery_mat"/>
+      <geom name="fork_handle" type="box" pos="-0.030 0 0" size="0.045 0.006 0.003" material="fork_mat"/>
+      <geom name="fork_head" type="box" pos="0.026 0 0" size="0.026 0.014 0.003" material="fork_mat"/>
     </body>
 
     <!-- ================= Cameras =================

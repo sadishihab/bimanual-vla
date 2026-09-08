@@ -2,9 +2,14 @@
 """Render one frame of the bimanual table scene from each named camera."""
 
 import argparse
+import json
 import pathlib
+import sys
 
 import mujoco
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+from envs.randomize import randomize  # noqa: E402
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 SCENE = REPO_ROOT / "scenes" / "bimanual_table.xml"
@@ -17,6 +22,13 @@ def main() -> None:
     parser.add_argument("--out-dir", type=pathlib.Path, default=pathlib.Path("/tmp"))
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=960)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="domain randomization seed; omit to render the scene as authored",
+    )
+    parser.add_argument("--dump", action="store_true", help="print the sampled parameters as JSON")
     parser.add_argument(
         "--keyframe",
         default="home",
@@ -32,9 +44,16 @@ def main() -> None:
         if key_id < 0:
             raise SystemExit(f"no keyframe named {args.keyframe!r} in {args.scene}")
         mujoco.mj_resetDataKeyframe(model, data, key_id)
+    # Randomize after the keyframe reset: the layout is written back into the
+    # keyframes, but the arm pose is whatever the reset above established.
+    info = randomize(model, data, args.seed) if args.seed is not None else None
     mujoco.mj_forward(model, data)
 
     print(f"loaded {args.scene}: {model.nu} actuators, {model.njnt} joints, {model.nbody} bodies")
+    if info is not None:
+        print(f"randomized with seed {args.seed}")
+        if args.dump:
+            print(json.dumps(info, indent=2, sort_keys=True))
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     with mujoco.Renderer(model, height=args.height, width=args.width) as renderer:
