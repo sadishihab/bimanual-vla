@@ -1,0 +1,114 @@
+<mujoco model="bimanual_table">
+  <!-- Two SO-101 arms mounted on a table for a bimanual table-setting task.
+       The single-arm model is pulled in twice via <attach>, which rewrites every
+       name in the submodel (bodies, joints, geoms, sites, actuators, defaults)
+       with the given prefix, so the left_ and right_ arms cannot collide. -->
+
+  <compiler angle="radian" autolimits="true"/>
+  <option timestep="0.002" integrator="implicitfast"/>
+
+  <visual>
+    <global offwidth="1920" offheight="1440" azimuth="140" elevation="-25"/>
+    <quality shadowsize="4096" offsamples="8"/>
+    <map znear="0.02" zfar="30"/>
+  </visual>
+
+  <asset>
+    <model name="so101" file="../third_party/SO-ARM100/Simulation/SO101/so101_new_calib.xml"/>
+
+    <texture name="skybox" type="skybox" builtin="gradient" rgb1="0.35 0.45 0.6" rgb2="0.1 0.12 0.16"
+             width="512" height="512"/>
+    <texture name="floor_tex" type="2d" builtin="checker" rgb1="0.24 0.26 0.29" rgb2="0.30 0.32 0.35"
+             width="512" height="512"/>
+    <material name="floor_mat" texture="floor_tex" texrepeat="6 6" reflectance="0.05"/>
+
+    <material name="table_top_mat" rgba="0.75 0.60 0.42 1"/>
+    <material name="table_leg_mat" rgba="0.30 0.24 0.18 1"/>
+    <material name="plate_mat" rgba="0.95 0.95 0.93 1"/>
+    <material name="mug_mat" rgba="0.20 0.42 0.75 1"/>
+    <material name="cutlery_mat" rgba="0.78 0.79 0.82 1"/>
+  </asset>
+
+  <default>
+    <!-- Manipulable props: light, high-friction contacts so they settle and stay put. -->
+    <default class="prop">
+      <geom condim="4" friction="1.0 0.02 0.001" solref="0.004 1" density="600"/>
+    </default>
+    <default class="table">
+      <geom type="box" condim="3" friction="0.9 0.01 0.001"/>
+    </default>
+  </default>
+
+  <worldbody>
+    <light name="key" pos="0.3 0.6 2.2" dir="-0.1 -0.3 -1" directional="true" diffuse="0.55 0.55 0.55"/>
+    <light name="fill" pos="0.3 -0.8 1.8" dir="-0.1 0.4 -1" diffuse="0.35 0.35 0.35" specular="0.1 0.1 0.1"/>
+
+    <geom name="floor" type="plane" size="4 4 0.05" material="floor_mat" pos="0 0 0"/>
+
+    <!-- ================= Table =================
+         Top surface at z = 0.75, spanning x in [-0.36, 0.40], y in [-0.36, 0.36].
+         Sized to the arms rather than to a real table: the bases sit at y = +/-0.2 with
+         0.16 m of margin behind them, and every point of the top is within reach of at
+         least one arm. See the reach note on the arm bodies below. -->
+    <body name="table" pos="0.02 0 0">
+      <geom name="table_top" class="table" pos="0 0 0.735" size="0.38 0.36 0.015" material="table_top_mat"/>
+      <geom name="table_leg_fl" class="table" pos=" 0.34  0.32 0.36" size="0.025 0.025 0.36" material="table_leg_mat"/>
+      <geom name="table_leg_fr" class="table" pos=" 0.34 -0.32 0.36" size="0.025 0.025 0.36" material="table_leg_mat"/>
+      <geom name="table_leg_bl" class="table" pos="-0.34  0.32 0.36" size="0.025 0.025 0.36" material="table_leg_mat"/>
+      <geom name="table_leg_br" class="table" pos="-0.34 -0.32 0.36" size="0.025 0.025 0.36" material="table_leg_mat"/>
+    </body>
+
+    <!-- ================= Arms =================
+         Bases 0.4 m apart on Y, both facing +x across the table. Sampling the arm
+         kinematics at table height (0.755 <= z <= 0.82) gives a shared reachable band of
+         roughly x in [-0.15, 0.25], |y| <= 0.20 -- the centre strip of the table, where
+         the place setting gets assembled. -->
+    <body name="left_mount" pos="-0.15 0.2 0.75">
+      <attach model="so101" body="base" prefix="left_"/>
+    </body>
+    <body name="right_mount" pos="-0.15 -0.2 0.75">
+      <attach model="so101" body="base" prefix="right_"/>
+    </body>
+
+    <!-- ================= Props =================
+         The plate starts in the shared centre strip -- the anchor of the place setting,
+         reachable by either arm. The fork is staged outboard of the left arm and the
+         spoon and mug outboard of the right, which is where each ends up relative to the
+         plate in a finished setting. All four are simple primitives on a free joint. -->
+    <body name="plate" pos="0.08 0.00 0.762" childclass="prop">
+      <freejoint name="plate_free"/>
+      <geom name="plate_body" type="cylinder" size="0.075 0.010" material="plate_mat"/>
+    </body>
+
+    <body name="mug" pos="0.22 -0.26 0.797" childclass="prop">
+      <freejoint name="mug_free"/>
+      <geom name="mug_body" type="cylinder" size="0.038 0.045" material="mug_mat"/>
+      <geom name="mug_handle" type="capsule" fromto="0.038 0 0.012 0.038 0 -0.012" size="0.009" material="mug_mat"/>
+    </body>
+
+    <body name="spoon" pos="0.08 -0.28 0.755" childclass="prop">
+      <freejoint name="spoon_free"/>
+      <geom name="spoon_handle" type="box" pos="-0.030 0 0" size="0.045 0.006 0.003" material="cutlery_mat"/>
+      <geom name="spoon_bowl" type="ellipsoid" pos="0.028 0 0" size="0.026 0.017 0.005" material="cutlery_mat"/>
+    </body>
+
+    <body name="fork" pos="0.08 0.28 0.755" childclass="prop">
+      <freejoint name="fork_free"/>
+      <geom name="fork_handle" type="box" pos="-0.030 0 0" size="0.045 0.006 0.003" material="cutlery_mat"/>
+      <geom name="fork_head" type="box" pos="0.026 0 0" size="0.026 0.014 0.003" material="cutlery_mat"/>
+    </body>
+
+    <!-- ================= Cameras =================
+         Both frame the whole table, both arms and all four props. -->
+    <camera name="overhead" pos="0.02 0 1.92" xyaxes="0 1 0 -1 0 0" fovy="45"/>
+    <camera name="front" pos="1.25 0 1.20" xyaxes="0 1 0 -0.2736 0 0.9617" fovy="45"/>
+  </worldbody>
+
+  <!-- Ready pose: both arms raised over the table, grippers ~12 cm above the top.
+       qpos is [12 arm joints | plate | mug | spoon | fork free joints]. -->
+  <keyframe>
+    <key name="home"
+         qpos="0 -0.6 1.3 -0.6 0 0.6  0 -0.6 1.3 -0.6 0 0.6  0.08 0 0.762 1 0 0 0  0.22 -0.26 0.797 1 0 0 0  0.08 -0.28 0.755 1 0 0 0  0.08 0.28 0.755 1 0 0 0"
+         ctrl="0 -0.6 1.3 -0.6 0 0.6  0 -0.6 1.3 -0.6 0 0.6"/>
+  </keyframe>
+</mujoco>
