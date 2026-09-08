@@ -18,10 +18,22 @@ from control.ik import ARM_JOINTS, IKSolver, top_down_mat
 # Gripper actuator: the jaw closes at the low end of ctrlrange and opens toward
 # the high end (verified against the SO-101 model).
 GRIPPER_OPEN = 1.10
-GRIPPER_CLOSED = -0.15
+GRIPPER_SHUT = -0.15     # hard stop, used only when there is nothing to hold
+# Commanding the hard stop on an object drives the servo to its full 3.35 N.m
+# against whatever is between the jaws: measured 6 mm of penetration into a 12 mm
+# handle, i.e. the jaws close straight through it, and the stored energy throws
+# the prop out on the next move.  Instead close to the object's own width less a
+# small squeeze, so the servo stalls on the object the way a real gripper does.
+GRIPPER_SQUEEZE = 0.002  # m of interference commanded into the object
+GRIPPER_CLEARANCE = 0.016  # m of total jaw daylight around the object on approach
+WIDE_OPEN = 0.10         # sentinel gap for "jaw is clear of the grasp region"
 
-APPROACH_HEIGHT = 0.10   # m above the grasp point for the standoff waypoint
-LIFT_HEIGHT = 0.10       # m above the grasp point for the final waypoint
+# Standoff and lift stay inside the arm's top-down envelope, whose ceiling is
+# 93 mm above the table.  The old 0.10 m put both waypoints above it, so neither
+# converged and the arm entered the descent from a pose centimetres off target.
+APPROACH_HEIGHT = 0.05   # m above the grasp point for the standoff waypoint
+LIFT_HEIGHT = 0.05       # m above the grasp point for the final waypoint
+CARTESIAN_STEPS = 12     # sub-waypoints along a straight-line gripper path
 MIN_FINGER_Z = 0.010     # m above the table top, so the jaws clear the surface
 # The gripper site sits on the *fixed* finger, not in the middle of the jaw
 # aperture: opening the gripper swings only the moving jaw, so the aperture spans
@@ -50,15 +62,17 @@ def _body_geoms(model: mujoco.MjModel, bid: int) -> List[int]:
     return [g for g in range(model.ngeom) if model.geom_bodyid[g] == bid]
 
 
-def _body_bbox(model: mujoco.MjModel, bid: int) -> Tuple[np.ndarray, np.ndarray]:
+def _body_bbox(model: mujoco.MjModel, bid: int,
+               geoms: Optional[List[int]] = None) -> Tuple[np.ndarray, np.ndarray]:
     """Axis-aligned bounding box of a body's geoms, in the body frame.
 
     Returns ``(centre, half_extent)``.  Each geom's own local AABB corners are
     rotated into the body frame, which handles the offset/rotated primitives the
-    props are built from.
+    props are built from.  ``geoms`` restricts the box to a subset -- the grasp
+    feature, rather than the whole prop.
     """
     corners = []
-    for gid in _body_geoms(model, bid):
+    for gid in (_body_geoms(model, bid) if geoms is None else geoms):
         c, h = model.geom_aabb[gid][:3], model.geom_aabb[gid][3:]
         rot = np.zeros(9)
         mujoco.mju_quat2Mat(rot, model.geom_quat[gid])
@@ -91,7 +105,11 @@ def grasp_pose(model: mujoco.MjModel, data: mujoco.MjData,
     if bid < 0:
         raise ValueError(f"scene has no body {object_name}")
 
-    centre, half = _body_bbox(model, bid)
+    # A prop may declare its grasp feature as a geom named <prop>_grasp.  Without
+    # that, the merged bounding box of a fork is dominated by its head and the
+    # grasp lands on the wrong part at the wrong width.
+    feature = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, f"{object_name}_grasp")
+    centre, half = _body_bbox(model, bid, [feature] if feature >= 0 else None)
     rot = data.xmat[bid].reshape(3, 3)
     world_centre = data.xpos[bid] + rot @ centre
 
@@ -110,6 +128,7 @@ def grasp_pose(model: mujoco.MjModel, data: mujoco.MjData,
     pos = np.array([world_centre[0], world_centre[1], grasp_z])
     info = {
         "grasp_width": width,
+        "grasp_feature": mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, feature) if feature >= 0 else None,
         "object_bottom_z": bottom,
         "object_top_z": top,
         "object_half_extent": half.tolist(),
@@ -161,6 +180,64 @@ def _object_contacts(model: mujoco.MjModel, data: mujoco.MjData,
 # ---------------------------------------------------------------------------
 
 
+def _jaw_gap(model: mujoco.MjModel, scratch: mujoco.MjData, arm: str,
+             site: int, jaw_q: float) -> float:
+    """Opening between the jaw faces, in metres, at gripper joint angle ``jaw_q``.
+
+    Measured off the collision meshes rather than assumed: the moving jaw swings
+    on an arc, so the gap is not linear in the joint angle.  Only vertices near
+    the grasp point count -- the jaw bodies extend well behind it.
+    """
+    jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, f"{arm}_gripper")
+    scratch.qpos[model.jnt_qposadr[jid]] = jaw_q
+    mujoco.mj_kinematics(model, scratch)
+    origin = scratch.site_xpos[site]
+    rot = scratch.site_xmat[site].reshape(3, 3)
+    approach, opening = rot[:, 0], rot[:, 2]
+
+    spans = {}
+    for body in (f"{arm}_gripper", f"{arm}_moving_jaw_so101_v1"):
+        bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body)
+        pts = []
+        for gid in _body_geoms(model, bid):
+            mesh = model.geom_dataid[gid]
+            if mesh < 0 or model.geom_group[gid] != 3:
+                continue
+            a, n = model.mesh_vertadr[mesh], model.mesh_vertnum[mesh]
+            verts = model.mesh_vert[a:a + n].astype(float)
+            world = scratch.geom_xpos[gid] + verts @ scratch.geom_xmat[gid].reshape(3, 3).T
+            local = world - origin
+            pts.append(local[np.abs(local @ approach) < 0.025] @ opening)
+        spans[body] = np.concatenate(pts) if pts else np.empty(0)
+    moving, fixed = spans[f"{arm}_moving_jaw_so101_v1"], spans[f"{arm}_gripper"]
+    if not len(moving) or not len(fixed):
+        # Past roughly q = 0.6 the moving jaw has swung clear of the grasp region
+        # altogether; there is no meaningful gap left to measure, only "wide open".
+        return WIDE_OPEN
+    return float(moving.min() - fixed.max())
+
+
+def gripper_angle_for(model: mujoco.MjModel, arm: str, gap: float,
+                      site: int, iters: int = 24) -> float:
+    """Gripper joint angle giving a jaw opening of ``gap`` metres.
+
+    Bisection on :func:`_jaw_gap`, which is monotone in the joint angle.  Falls
+    back to the hard stop when the requested gap is below what the jaws can reach.
+    """
+    scratch = mujoco.MjData(model)
+    lo, hi = float(model.jnt_range[mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_JOINT, f"{arm}_gripper")][0]), GRIPPER_OPEN
+    if _jaw_gap(model, scratch, arm, site, lo) >= gap:
+        return lo
+    for _ in range(iters):
+        mid = 0.5 * (lo + hi)
+        if _jaw_gap(model, scratch, arm, site, mid) < gap:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
 def _arm_actuators(model: mujoco.MjModel, arm: str) -> Tuple[np.ndarray, int]:
     ids = []
     for name in ARM_JOINTS:
@@ -195,6 +272,26 @@ def _ramp(model: mujoco.MjModel, data: mujoco.MjData, act: np.ndarray, grip: int
         data.ctrl[act] = q_start + alpha * (q_end - q_start)
         data.ctrl[grip] = g_start + alpha * (g_end - g_start)
         mujoco.mj_step(model, data)
+
+
+def _move_line(model: mujoco.MjModel, data: mujoco.MjData, act: np.ndarray, grip: int,
+               solver: IKSolver, start: np.ndarray, end: np.ndarray, yaw: float,
+               duration: float, steps: int = CARTESIAN_STEPS) -> Dict[str, object]:
+    """Drive the gripper site along a straight line, re-solving IK at each step.
+
+    Interpolating joint targets between two waypoints lets the tool frame bow
+    away from the straight path between them, which is what drove the gripper
+    into the object during the descent: the jaws arrived from the side and
+    collided before they were around it.  Re-solving IK along the line keeps the
+    approach purely vertical, so the jaws straddle the object and touch nothing
+    until they close.
+    """
+    info: Dict[str, object] = {}
+    for k in range(1, steps + 1):
+        point = start + (end - start) * (k / steps)
+        q, info = solver.solve(data, point, top_down_mat(yaw))
+        _ramp(model, data, act, grip, q, None, duration / steps)
+    return info
 
 
 def pick(model: mujoco.MjModel, data: mujoco.MjData, arm: str,
@@ -234,28 +331,43 @@ def pick(model: mujoco.MjModel, data: mujoco.MjData, arm: str,
     geom["jaw_offset"] = float(np.linalg.norm(target[:2] - centre[:2]))
     geom["grasp_ik"] = {"at_grasp": low["pos_err"], "at_standoff": high["pos_err"]}
 
-    waypoints = (
-        ("approach", target + np.array([0.0, 0.0, APPROACH_HEIGHT]), GRIPPER_OPEN, APPROACH_TIME),
-        ("descend", target, GRIPPER_OPEN, DESCEND_TIME),
-        ("close", None, GRIPPER_CLOSED, CLOSE_TIME),
-        ("lift", target + np.array([0.0, 0.0, LIFT_HEIGHT]), GRIPPER_CLOSED, LIFT_TIME),
-    )
-
+    standoff = target + np.array([0.0, 0.0, APPROACH_HEIGHT])
+    lifted_to = target + np.array([0.0, 0.0, LIFT_HEIGHT])
     stages: List[Dict[str, object]] = []
-    for name, pos, grip_target, duration in waypoints:
-        record: Dict[str, object] = {"stage": name}
-        q_target = None
-        if pos is not None:
-            q_target, ik_info = solver.solve(data, pos, top_down_mat(yaw))
-            record["target_pos"] = np.asarray(pos).tolist()
-            record["ik"] = ik_info
-        _ramp(model, data, act, grip, q_target, grip_target, duration)
-        record["site_pos"] = data.site_xpos[solver.site].tolist()
-        if pos is not None:
-            record["site_err"] = float(np.linalg.norm(data.site_xpos[solver.site] - pos))
-        record["object_z"] = float(data.xpos[bid][2])
-        record["contacts"] = _object_contacts(model, data, bid)
-        stages.append(record)
+
+    def record(name: str, ik: Optional[Dict[str, object]], goal: Optional[np.ndarray]) -> None:
+        r: Dict[str, object] = {"stage": name, "site_pos": data.site_xpos[solver.site].tolist()}
+        if ik is not None:
+            r["ik"] = ik
+            r["target_pos"] = np.asarray(goal).tolist()
+            r["site_err"] = float(np.linalg.norm(data.site_xpos[solver.site] - goal))
+        r["object_z"] = float(data.xpos[bid][2])
+        r["contacts"] = _object_contacts(model, data, bid)
+        stages.append(r)
+
+    # Approach through free space above the object, opening the jaws on the way.
+    close_to = gripper_angle_for(model, arm, geom["grasp_width"] - GRIPPER_SQUEEZE,
+                                 solver.site)
+    # Open fully. Opening only just past the object was measured worse: the moving
+    # jaw sits lower on a tighter arc and grazes the prop during the descent,
+    # taking the dish's descend error from 0.9 mm to 8.5 mm.
+    open_to = GRIPPER_OPEN
+    geom["close_ctrl"], geom["open_ctrl"] = close_to, open_to
+
+    q, ik = solver.solve(data, standoff, top_down_mat(yaw))
+    _ramp(model, data, act, grip, q, open_to, APPROACH_TIME)
+    record("approach", ik, standoff)
+
+    # Straight down onto the grasp point, jaws held open and clear of the object.
+    ik = _move_line(model, data, act, grip, solver, standoff, target, yaw, DESCEND_TIME)
+    record("descend", ik, target)
+
+    _ramp(model, data, act, grip, None, close_to, CLOSE_TIME)
+    record("close", None, None)
+
+    # Straight back up, so a successful grasp is not levered against the table.
+    ik = _move_line(model, data, act, grip, solver, target, lifted_to, yaw, LIFT_TIME)
+    record("lift", ik, lifted_to)
 
     _ramp(model, data, act, grip, None, None, HOLD_TIME)
 

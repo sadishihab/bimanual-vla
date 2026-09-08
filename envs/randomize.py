@@ -306,15 +306,18 @@ class PropSpec:
 
 # The plate is the anchor of the place setting, so it is restricted to the region
 # both arms share; the others only need one arm each.
+# Heights are the world z of each prop's <name>_grasp geom once it has settled on
+# the table, all inside the measured 12-88 mm usable band.  Bodies rest with their
+# origin on the table top, so spawn_z is uniformly 2 mm of drop clearance.
 PROPS: Tuple[PropSpec, ...] = (
-    PropSpec("plate", "plate_mat", 0.075, 0.762, 0.775, "both",
-             (0.15, 0.45), (0.4, 1.2), (0.005, 0.050), (0.05, 0.45), (0.70, 1.00)),
-    PropSpec("mug", "mug_mat", 0.047, 0.797, 0.835, "any",
-             (0.20, 0.50), (0.5, 1.3), (0.005, 0.050), (0.45, 0.90), (0.45, 0.90)),
-    PropSpec("spoon", "spoon_mat", 0.075, 0.755, 0.762, "any",
-             (0.02, 0.06), (0.3, 1.0), (0.002, 0.020), (0.10, 0.60), (0.50, 0.95)),
-    PropSpec("fork", "fork_mat", 0.075, 0.755, 0.762, "any",
-             (0.02, 0.06), (0.3, 1.0), (0.002, 0.020), (0.10, 0.60), (0.50, 0.95)),
+    PropSpec("plate", "plate_mat", 0.017, 0.752, 0.764, "both",
+             (0.03, 0.09), (0.4, 1.2), (0.005, 0.050), (0.05, 0.45), (0.70, 1.00)),
+    PropSpec("mug", "mug_mat", 0.032, 0.752, 0.782, "any",
+             (0.05, 0.15), (0.5, 1.3), (0.005, 0.050), (0.45, 0.90), (0.45, 0.90)),
+    PropSpec("spoon", "spoon_mat", 0.075, 0.752, 0.774, "any",
+             (0.01, 0.04), (0.3, 1.0), (0.002, 0.020), (0.10, 0.60), (0.50, 0.95)),
+    PropSpec("fork", "fork_mat", 0.075, 0.752, 0.774, "any",
+             (0.01, 0.04), (0.3, 1.0), (0.002, 0.020), (0.10, 0.60), (0.50, 0.95)),
 )
 
 PROP_SPACING = 0.02              # extra gap between prop bounding circles
