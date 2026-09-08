@@ -12,7 +12,7 @@ import sys
 import mujoco
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from control.primitives import pick  # noqa: E402
+from control.primitives import best_arm, pick  # noqa: E402
 from envs.randomize import randomize  # noqa: E402
 from envs.scene import SCENE, load_scene  # noqa: E402
 
@@ -20,7 +20,8 @@ from envs.scene import SCENE, load_scene  # noqa: E402
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seed", type=int, required=True, help="the one seed to run")
-    parser.add_argument("--arm", choices=("left", "right"), default="right")
+    parser.add_argument("--arm", choices=("left", "right", "auto"), default="auto",
+                        help="'auto' picks whichever arm can grasp it and lift highest")
     parser.add_argument("--object", default="plate")
     parser.add_argument("--scene", type=pathlib.Path, default=SCENE)
     parser.add_argument("--dump", action="store_true", help="print the full report as JSON")
@@ -32,24 +33,36 @@ def main() -> None:
     randomize(model, data, args.seed)
     mujoco.mj_forward(model, data)
 
-    report = pick(model, data, args.arm, args.object)
+    arm = best_arm(model, data, args.object)[0] if args.arm == "auto" else args.arm
+    report = pick(model, data, arm, args.object)
 
-    print(f"seed {args.seed}: {args.arm} arm picking {args.object}")
+    g = report["geometry"]
+    print(f"seed {args.seed}: {arm} arm picking {args.object}"
+          f"{' (auto)' if args.arm == 'auto' else ''}")
     print(f"  grasp target   {_fmt(report['grasp_target'])}  yaw {report['grasp_yaw']:+.3f} rad")
-    print(f"  grasp width    {report['geometry']['grasp_width'] * 1000:.1f} mm")
+    print(f"  grasp width    {g['grasp_width'] * 1000:.1f} mm")
+    for name, req in (("standoff", 50.0), ("lift", 50.0)):
+        w = g[name]
+        print(f"  {name:<9s}      +{w['height'] * 1000:5.1f} mm of {req:.0f} requested"
+              f"   {'CLAMPED' if w['clamped'] else 'as asked'}"
+              f"{'' if w['floor_ok'] else '  (floor itself unreachable)'}"
+              f"{'  starts below the object top' if name == 'standoff' and g['standoff_below_object'] else ''}")
     for stage in report["stages"]:
         line = f"  {stage['stage']:<9}"
         if "ik" in stage:
             ik = stage["ik"]
+            worst = ik.get("worst_pos_err", ik["pos_err"])
+            ok = ik.get("all_converged", ik["converged"])
             line += (f" ik pos_err {ik['pos_err'] * 1000:6.2f} mm"
-                     f"  rot_err {ik['rot_err']:5.3f} rad"
-                     f"  {'ok' if ik['converged'] else 'NOT CONVERGED'}")
+                     f"  worst {worst * 1000:6.2f} mm"
+                     f"  {'ok ' if ok else 'NOT CONVERGED'}")
             line += f" | site_err {stage['site_err'] * 1000:6.2f} mm"
         else:
-            line += " " * 58
+            line += " " * 55
         c = stage["contacts"]
         g = stage["grip_force"]
-        line += (f" | obj z {stage['object_z']:.4f} contacts table={c['table']} arm={c['arm']}"
+        line += (f" | obj z {stage['object_z']:.4f} shift {stage['object_shift'] * 1000:5.1f} mm"
+                 f" contacts table={c['table']} arm={c['arm']}"
                  f" | jaw {stage['jaw_gap'] * 1000:5.1f} mm"
                  f" grip {g['fixed']:6.2f}/{g['moving']:6.2f} N")
         print(line)

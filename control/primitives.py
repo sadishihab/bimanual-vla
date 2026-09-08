@@ -20,7 +20,8 @@ import mujoco
 import numpy as np
 
 from control.gripper import GRIP_TORQUE, OPEN_TORQUE
-from control.ik import ARM_JOINTS, IKSolver, top_down_mat
+from control.ik import (ARM_JOINTS, IKSolver, reachable_above, reachable_toward,
+                        top_down_mat)
 
 # Gripper commands are torques (see control.gripper): OPEN_TORQUE holds the jaw
 # back against its upper stop, GRIP_TORQUE is the squeeze.  There is no commanded
@@ -31,8 +32,12 @@ WIDE_OPEN = 0.10         # sentinel gap for "jaw is clear of the grasp region"
 # Standoff and lift stay inside the arm's top-down envelope, whose ceiling is
 # 93 mm above the table.  The old 0.10 m put both waypoints above it, so neither
 # converged and the arm entered the descent from a pose centimetres off target.
+# Both are *requested* heights.  Each is clamped down to whatever the arm can
+# actually reach above that particular grasp point -- see control.ik.reachable_above
+# -- because a waypoint the arm cannot reach bends the whole path, not just its end.
 APPROACH_HEIGHT = 0.05   # m above the grasp point for the standoff waypoint
 LIFT_HEIGHT = 0.05       # m above the grasp point for the final waypoint
+MIN_STANDOFF = 0.010     # m; below this the descent is not a descent
 CARTESIAN_STEPS = 12     # sub-waypoints along a straight-line gripper path
 MIN_FINGER_Z = 0.010     # m above the table top, so the jaws clear the surface
 # The gripper site sits on the *fixed* finger, not in the middle of the jaw
@@ -46,6 +51,7 @@ LIFT_THRESHOLD = 0.03    # m of net rise that counts as a successful lift
 
 # Waypoint durations in seconds; converted to steps with the model timestep.
 SETTLE_TIME = 0.5
+OPEN_TIME = 0.4          # s to swing the jaws back to their stop before moving
 APPROACH_TIME = 1.5
 DESCEND_TIME = 1.0
 # Closing is now a torque held until the jaw arrives, not a servo step, so it has
@@ -294,7 +300,8 @@ def _ramp(model: mujoco.MjModel, data: mujoco.MjData, act: np.ndarray, grip: int
 def _move_line(model: mujoco.MjModel, data: mujoco.MjData, act: np.ndarray, grip: int,
                solver: IKSolver, start: np.ndarray, end: np.ndarray, yaw: float,
                duration: float, steps: int = CARTESIAN_STEPS,
-               probe: Optional[Callable[[int], None]] = None) -> Dict[str, object]:
+               probe: Optional[Callable[[int], None]] = None,
+               clamp: bool = False) -> Dict[str, object]:
     """Drive the gripper site along a straight line, re-solving IK at each step.
 
     Interpolating joint targets between two waypoints lets the tool frame bow
@@ -305,13 +312,137 @@ def _move_line(model: mujoco.MjModel, data: mujoco.MjData, act: np.ndarray, grip
     until they close.
     """
     info: Dict[str, object] = {}
+    mat = top_down_mat(yaw)
+    worst, every = 0.0, True
     for k in range(1, steps + 1):
         point = start + (end - start) * (k / steps)
-        q, info = solver.solve(data, point, top_down_mat(yaw))
+        # ``clamp`` is for a transit whose straight line leaves the envelope in
+        # the middle even though both ends are inside it.  Each sub-step is pulled
+        # toward the end of the leg until it converges, which keeps the motion
+        # monotone toward the goal and every command a pose the arm can hold.
+        if clamp:
+            point, _ = reachable_toward(solver, data, point, end, mat)
+        q, info = solver.solve(data, point, mat)
+        worst = max(worst, float(info["pos_err"]))
+        every = every and bool(info["converged"])
         _ramp(model, data, act, grip, q, None, duration / steps)
         if probe is not None:
             probe(k)
+    # Clamping the endpoints is not the same as the whole line being flyable, so
+    # the worst sub-step is reported too rather than only the one we land on.
+    info["worst_pos_err"] = worst
+    info["all_converged"] = every
     return info
+
+
+def path_fouls(model: mujoco.MjModel, data: mujoco.MjData, solver: IKSolver,
+               arm: str, start: np.ndarray, end: np.ndarray, yaw: float, bid: int,
+               steps: int = CARTESIAN_STEPS) -> int:
+    """Sub-steps of a straight-line path where the open gripper already touches the prop.
+
+    A waypoint that converges is not yet a waypoint that can be flown to: the
+    descent can still put the jaws through the object on the way in, and then the
+    arm stalls against it while IK goes on reporting a millimetre of residual.
+    Measured on the plate, whose two arms are within 0.01 mm of each other on
+    grasp residual: one descends cleanly, the other arrives 14.42 mm short with a
+    21.82 N one-sided shove on the prop.  Nothing kinematic about the grasp pose
+    distinguishes them -- only the corridor does.
+
+    Kinematic only.  Each sub-step's IK solution is written into a scratch state
+    with the jaws run out to their stop, where they sit under the opening torque,
+    and MuJoCo's own collision pass is asked what touches what.  No physics is
+    stepped and no renderer is built.
+
+    The seeding has to match :func:`_move_line` exactly or the check answers about
+    a different arm.  Five joints against a six-DOF target leaves isolated
+    solution branches, and DLS lands in whichever one its seed is nearest: solving
+    each sub-step cold from the home pose put this arm on a branch with a
+    different shoulder_pan, whose pad clears the plate by 5 mm, while the branch
+    the motion actually flies -- warm-started at the standoff and then chained
+    down the line -- puts the same pad 13.3 mm from the plate's axis, inside its
+    17 mm rim.  So the standoff is solved from ``data`` as the approach does, and
+    every sub-step from the one before it.
+    """
+    scratch = mujoco.MjData(model)
+    scratch.qpos[:] = data.qpos
+    jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, f"{arm}_gripper")
+    scratch.qpos[model.jnt_qposadr[jid]] = model.jnt_range[jid, 1]
+
+    fouls = 0
+    q, _ = solver.solve(data, start, top_down_mat(yaw))
+    for k in range(steps + 1):
+        point = start + (end - start) * (k / steps)
+        q, _ = solver.solve(scratch, point, top_down_mat(yaw), seed=q)
+        scratch.qpos[solver.qadr] = q
+        mujoco.mj_forward(model, scratch)
+        fouls += bool(_object_contacts(model, scratch, bid)["arm"])
+    return fouls
+
+
+def plan_grasp(model: mujoco.MjModel, data: mujoco.MjData, arm: str,
+               object_name: str) -> Dict[str, object]:
+    """Choose the grasp pose and both waypoint heights for ``arm`` on ``object_name``.
+
+    Both members of the symmetric yaw pair are costed, and the one that lets the
+    arm lift highest wins: a yaw that grasps but cannot then go anywhere is not
+    the better grasp.  Pure kinematics, so :func:`best_arm` can use it to compare
+    arms without stepping the simulation.
+    """
+    solver = IKSolver(model, arm)
+    bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, object_name)
+    centre, yaw0, geom = grasp_pose(model, data, object_name)
+
+    best = None
+    for pos, candidate in grasp_candidates(centre, yaw0, geom["grasp_width"]):
+        q_low, low = solver.solve(data, pos, top_down_mat(candidate))
+        # Seeded the way each motion is: the approach solves the standoff cold
+        # from wherever the arm is, the lift solves warm from the grasp pose.
+        stand, s_info = reachable_above(solver, data, pos, candidate, APPROACH_HEIGHT,
+                                        floor=MIN_STANDOFF)
+        lift, l_info = reachable_above(solver, data, pos, candidate, LIFT_HEIGHT,
+                                       seed=q_low)
+        fouls = path_fouls(model, data, solver, arm, stand, pos, candidate, bid)
+        score = (not low["converged"], fouls, -l_info["height"],
+                 low["pos_err"] + low["rot_err"])
+        if best is None or score < best[0]:
+            best = (score, pos, candidate, low, stand, s_info, lift, l_info, fouls)
+
+    _, target, yaw, low, standoff, s_info, lifted_to, l_info, fouls = best
+    geom["chosen_yaw"] = yaw
+    geom["jaw_offset"] = float(np.linalg.norm(target[:2] - centre[:2]))
+    geom["grasp_ik"] = {"at_grasp": low["pos_err"], "converged": low["converged"]}
+    geom["standoff"] = {k: s_info[k] for k in ("height", "clamped", "floor_ok")}
+    geom["lift"] = {k: l_info[k] for k in ("height", "clamped", "floor_ok")}
+    # A standoff clamped below the object's top starts the descent alongside the
+    # prop rather than above it.  With the jaws run back to their stop that is
+    # measured clear, but it is worth knowing when it happens.
+    geom["standoff_below_object"] = bool(target[2] + s_info["height"] < geom["object_top_z"])
+    geom["descent_fouls"] = int(fouls)
+    return {"solver": solver, "centre": centre, "target": target, "yaw": yaw,
+            "standoff": standoff, "lifted_to": lifted_to, "geometry": geom,
+            "grasp_ok": bool(low["converged"]), "lift_height": float(l_info["height"]),
+            "fouls": int(fouls)}
+
+
+def best_arm(model: mujoco.MjModel, data: mujoco.MjData,
+             object_name: str) -> Tuple[str, Dict[str, object]]:
+    """Which arm should pick ``object_name``: the one that can grasp it and lift highest.
+
+    Reach is not symmetric -- the props are placed by a per-arm reach map, and a
+    prop out at one side is often graspable by one arm only -- so the arm cannot
+    be fixed per prop across seeds.  Ordered by whether the grasp converges, then
+    by a descent corridor clear of the prop, then by lift height, then by grasp
+    residual.  Residual alone is useless as a tie-break here: on the plate the two
+    arms differ by 0.01 mm and one of them drives straight into it.
+    """
+    best = None
+    for arm in ("left", "right"):
+        plan = plan_grasp(model, data, arm, object_name)
+        score = (not plan["grasp_ok"], plan["fouls"], -plan["lift_height"],
+                 plan["geometry"]["grasp_ik"]["at_grasp"])
+        if best is None or score < best[0]:
+            best = (score, arm, plan)
+    return best[1], best[2]
 
 
 def pick(model: mujoco.MjModel, data: mujoco.MjData, arm: str,
@@ -327,32 +458,16 @@ def pick(model: mujoco.MjModel, data: mujoco.MjData, arm: str,
         raise ValueError(f"scene has no body {object_name}")
 
     act, grip = _arm_actuators(model, arm)
-    solver = IKSolver(model, arm)
 
     # Let the props drop the couple of millimetres they spawn above the table.
     _ramp(model, data, act, grip, None, None, SETTLE_TIME)
     rest_z = float(data.xpos[bid][2])
+    rest_xy = data.xpos[bid][:2].copy()
 
-    centre, yaw0, geom = grasp_pose(model, data, object_name)
-
-    # Pick the symmetric variant the arm can actually reach, preferring one that
-    # also works at the standoff height so approach and lift use the same grasp.
-    best = None
-    for pos, candidate in grasp_candidates(centre, yaw0, geom["grasp_width"]):
-        _, low = solver.solve(data, pos, top_down_mat(candidate))
-        _, high = solver.solve(data, pos + np.array([0.0, 0.0, APPROACH_HEIGHT]),
-                               top_down_mat(candidate))
-        score = (not low["converged"], not high["converged"],
-                 low["pos_err"] + low["rot_err"])
-        if best is None or score < best[0]:
-            best = (score, pos, candidate, low, high)
-    _, target, yaw, low, high = best
-    geom["chosen_yaw"] = yaw
-    geom["jaw_offset"] = float(np.linalg.norm(target[:2] - centre[:2]))
-    geom["grasp_ik"] = {"at_grasp": low["pos_err"], "at_standoff": high["pos_err"]}
-
-    standoff = target + np.array([0.0, 0.0, APPROACH_HEIGHT])
-    lifted_to = target + np.array([0.0, 0.0, LIFT_HEIGHT])
+    plan = plan_grasp(model, data, arm, object_name)
+    solver = plan["solver"]
+    centre, target, yaw = plan["centre"], plan["target"], plan["yaw"]
+    standoff, lifted_to, geom = plan["standoff"], plan["lifted_to"], plan["geometry"]
     stages: List[Dict[str, object]] = []
 
     def record(name: str, ik: Optional[Dict[str, object]], goal: Optional[np.ndarray]) -> None:
@@ -365,6 +480,9 @@ def pick(model: mujoco.MjModel, data: mujoco.MjData, arm: str,
         r["contacts"] = _object_contacts(model, data, bid)
         r["jaw_gap"] = jaw_gap(model, data, arm, solver.site)
         r["grip_force"] = grip_force(model, data, bid, arm)
+        # Horizontal shove, which z alone hides: a prop knocked sideways before
+        # the grasp leaves the descent aimed at where it used to be.
+        r["object_shift"] = float(np.linalg.norm(data.xpos[bid][:2] - rest_xy))
         stages.append(r)
 
     # Approach through free space above the object, opening the jaws on the way.
@@ -375,8 +493,16 @@ def pick(model: mujoco.MjModel, data: mujoco.MjData, arm: str,
     # it cannot graze the prop on the way down.
     geom["open_torque"], geom["grip_torque"] = OPEN_TORQUE, GRIP_TORQUE
 
-    q, ik = solver.solve(data, standoff, top_down_mat(yaw))
-    _ramp(model, data, act, grip, q, OPEN_TORQUE, APPROACH_TIME)
+    # Cartesian, not a joint ramp.  Interpolating joint targets from the home pose
+    # lets the tool bow off the line between the two, and the bow dips below the
+    # standoff: it swept the plate 7.4 mm sideways on seed 0, after which the
+    # descent -- aimed at where the plate used to be -- put the fixed pad on its
+    # rim.  A straight line from here to the standoff never goes below the
+    # standoff, since both ends are above the object and the line is monotone in z.
+    _ramp(model, data, act, grip, None, OPEN_TORQUE, OPEN_TIME)
+    ik = _move_line(model, data, act, grip, solver,
+                    data.site_xpos[solver.site].copy(), standoff, yaw, APPROACH_TIME,
+                    clamp=True)
     record("approach", ik, standoff)
 
     # Straight down onto the grasp point, jaws held open and clear of the object.
@@ -420,6 +546,7 @@ def pick(model: mujoco.MjModel, data: mujoco.MjData, arm: str,
         "object_centre": centre.tolist(),
         "geometry": geom,
         "rest_z": rest_z,
+        "approach_shift": float(stages[0]["object_shift"]),
         "final_z": final_z,
         "rise": rise,
         "contacts": contacts,

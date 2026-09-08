@@ -37,6 +37,8 @@ ROT_WEIGHT = 0.6        # orientation rows are down-weighted: position matters m
 LIMIT_MARGIN = 0.02     # rad, stay this far off the hard joint stops
 PATIENCE = 12           # iterations of no real progress before giving up
 MIN_IMPROVEMENT = 1e-5  # residual norm drop that still counts as progress
+CLAMP_ITERS = 8         # bisection steps when lowering a waypoint into the envelope
+CLAMP_SAFETY = 0.5      # a clamped waypoint must converge to this fraction of POS_TOL
 
 
 def top_down_mat(open_axis_yaw: float) -> np.ndarray:
@@ -79,6 +81,93 @@ def solve_top_down(solver: "IKSolver", data: mujoco.MjData, pos: np.ndarray,
             best = (q, info, score)
     best[1]["converged"] = False        # nothing satisfied both tests
     return best[0], best[1]
+
+
+def reachable_above(solver: "IKSolver", data: mujoco.MjData, base: np.ndarray,
+                    yaw: float, height: float, *, floor: float = 0.0,
+                    iters: int = CLAMP_ITERS,
+                    **kwargs) -> Tuple[np.ndarray, Dict[str, object]]:
+    """The highest waypoint ``base + z`` for z in ``[floor, height]`` that IK converges at.
+
+    Commanding a waypoint outside the arm's envelope does not merely miss it.  The
+    position servos saturate, the tool frame lags behind the command, and the
+    straight Cartesian path the caller asked for is not the path flown: measured
+    on the spoon, the lift's sub-step spacing collapsed from 4.2 mm to 3.0 mm as
+    the arm ran out of reach, and the resulting off-axis motion sheared the spoon
+    out of the jaws.  So a waypoint is worth having only if it converges, and this
+    lowers one until it does.
+
+    Bisection, which assumes reachability is monotone in z over the segment.  That
+    holds here because the binding constraint is the top-down envelope's ceiling
+    -- folding the wrist under to keep the approach vertical costs reach, and
+    costs more of it the higher the tool goes.  The returned point is always one
+    that converged, except when even ``floor`` fails, which the caller is told
+    about rather than left to infer.
+
+    The test is run at :data:`CLAMP_SAFETY` of the normal position tolerance, so
+    the answer is inside the envelope rather than on its edge.  DLS is seeded from
+    the arm's current pose, and a pose that just scrapes tolerance from one seed
+    can miss it from another -- the spoon's clamped lift landed at 1.25 mm when
+    re-solved during the motion, having been accepted at 1.00 mm here.
+    """
+    kwargs.setdefault("pos_tol", POS_TOL * CLAMP_SAFETY)
+
+    def at(z: float) -> Tuple[np.ndarray, Dict[str, object]]:
+        pos = base + np.array([0.0, 0.0, z])
+        _, info = solver.solve(data, pos, top_down_mat(yaw), **kwargs)
+        return pos, info
+
+    pos, info = at(height)
+    if info["converged"]:
+        return pos, {"height": float(height), "clamped": False, "floor_ok": True, "ik": info}
+
+    low_pos, low_info = at(floor)
+    if not low_info["converged"]:
+        return low_pos, {"height": float(floor), "clamped": True, "floor_ok": False,
+                         "ik": low_info}
+
+    lo, hi = floor, height
+    best_pos, best_info = low_pos, low_info
+    for _ in range(iters):
+        mid = 0.5 * (lo + hi)
+        pos, info = at(mid)
+        if info["converged"]:
+            lo, best_pos, best_info = mid, pos, info
+        else:
+            hi = mid
+    return best_pos, {"height": float(lo), "clamped": True, "floor_ok": True,
+                      "ik": best_info}
+
+
+def reachable_toward(solver: "IKSolver", data: mujoco.MjData, point: np.ndarray,
+                     goal: np.ndarray, target_mat: np.ndarray, *,
+                     iters: int = CLAMP_ITERS,
+                     **kwargs) -> Tuple[np.ndarray, Dict[str, object]]:
+    """Pull ``point`` toward ``goal`` until IK converges, and return where it stopped.
+
+    The companion to :func:`reachable_above` for a waypoint that is off the
+    envelope sideways rather than upward.  A transit interpolated in a straight
+    line from the arm's parked pose leaves the workspace in the middle of the
+    line -- 23 mm of residual on the way in to a plate that both ends of the line
+    reach comfortably -- and that cannot be clamped by lowering it.  ``goal`` must
+    itself be reachable, which is what makes the bisection well posed: the search
+    is over the fraction of the way from ``point`` to ``goal``.
+    """
+    _, info = solver.solve(data, point, target_mat, **kwargs)
+    if info["converged"]:
+        return point, info
+
+    lo, hi = 0.0, 1.0
+    best_point, best_info = np.asarray(goal, dtype=float), info
+    for _ in range(iters):
+        mid = 0.5 * (lo + hi)
+        candidate = point + (goal - point) * mid
+        _, info = solver.solve(data, candidate, target_mat, **kwargs)
+        if info["converged"]:
+            hi, best_point, best_info = mid, candidate, info
+        else:
+            lo = mid
+    return best_point, best_info
 
 
 class IKSolver:
