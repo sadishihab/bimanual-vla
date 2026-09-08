@@ -3,23 +3,44 @@
 The entry point is :func:`randomize`, which takes ``(model, data, seed)`` and
 mutates both in place.  A given seed always produces an identical scene.
 
-Prop placement is driven by a reachability map built from the same forward
-kinematics sweep used to size the table: the arm joints are swept on a grid, the
-gripper site positions are rasterized into an occupancy grid at the height each
-prop is grasped at, and the result is morphologically closed (to fill holes left
-by the finite joint sampling) and then eroded by a safety margin.  Props are only
-ever placed strictly inside that eroded region, so nothing can spawn somewhere
-neither arm can get to.
+Prop placement is driven by a reachability map that is *orientation-aware*: a
+cell counts as reachable only if the arm can put its gripper there with a
+top-down approach, which is the only approach the pick primitive uses.  Position
+alone is not enough -- constraining the approach axis to vertical folds the wrist
+under and costs several centimetres of reach, so a position-only map happily
+places props the arm can touch but cannot grasp.
+
+Building the map is a two-stage filter:
+
+1.  A cheap forward-kinematics sweep (the same one used to size the table)
+    rasterizes gripper site positions into an occupancy grid at the height the
+    prop is grasped at, then closes it to fill holes left by the finite joint
+    sampling.  Top-down reach is a strict subset of position reach, so this is a
+    sound prefilter, and it is what keeps stage 2 affordable.
+2.  Every surviving on-table cell is checked with the damped-least-squares
+    solver in :mod:`control.ik`: the cell survives only if IK converges there
+    with the approach axis vertical, for every grasp yaw tested.  Props get a
+    uniformly random yaw, so requiring all yaws is the correct semantics -- a
+    cell that only works at one yaw is not safe to spawn into.
+
+Stage 2 costs a couple of minutes per (arm, height), so masks are cached both in
+process and on disk under ``.cache/reach/``, keyed by a hash of the scene
+geometry and the map parameters.  The randomization itself does not affect the
+map: it changes masses, colours and lights, never link geometry.
 """
 
 from __future__ import annotations
 
 import colorsys
 import dataclasses
-from typing import Dict, Sequence, Tuple
+import hashlib
+import pathlib
+from typing import Dict, Optional, Sequence, Tuple
 
 import mujoco
 import numpy as np
+
+from control.ik import IKSolver, solve_top_down
 
 # ---------------------------------------------------------------------------
 # Reachability map
@@ -29,7 +50,13 @@ CELL = 0.01                    # occupancy grid resolution, metres
 GRID_X = (-0.60, 0.60)
 GRID_Y = (-0.80, 0.80)
 CLOSE_RADIUS = 0.03            # fills holes left by finite joint sampling
-REACH_MARGIN = 0.05            # stay this far inside the true reach boundary
+# Stay this far inside the reach boundary.  This used to be 0.05, sized for the
+# old position-only map whose edge was a fuzzy artefact of the finite joint sweep.
+# The stage-2 boundary is a real one -- IK convergence at 5 mm / 0.15 rad across
+# every yaw bin -- so a margin that large now double-counts safety and erodes the
+# mug's band at z = 0.835 to nothing.  Two cells of slack covers the grid
+# quantization and the Z_TOLERANCE band.
+REACH_MARGIN = 0.02
 Z_TOLERANCE = 0.04             # half-height of the band sampled around a grasp height
 
 # Joints swept when mapping reach, and the number of samples for each.  wrist_roll
@@ -37,6 +64,17 @@ Z_TOLERANCE = 0.04             # half-height of the band sampled around a grasp 
 SWEEP = (("shoulder_pan", 25), ("shoulder_lift", 21), ("elbow_flex", 21), ("wrist_flex", 13))
 
 _ARMS = ("left", "right")
+
+# Stage-2 (IK) filter.  Yaw bins span [0, pi) only: the jaws are symmetric, so a
+# grasp at yaw and at yaw + pi are the same grasp, and each bin is tried both
+# ways round.  Tolerances are looser than the solver defaults because the
+# controller ramps onto the target anyway -- a 5 mm miss and 8 degrees of tilt
+# still make a sound top-down grasp.
+IK_YAW_BINS = 3
+IK_POS_TOL = 0.005             # m
+IK_ROT_TOL = 0.15              # rad
+IK_MAX_ITERS = 60
+CACHE_DIR = pathlib.Path(__file__).resolve().parent.parent / ".cache" / "reach"
 
 
 def _disk(radius: float) -> Sequence[Tuple[int, int]]:
@@ -63,17 +101,23 @@ def _morph(grid: np.ndarray, radius: float, dilate: bool) -> np.ndarray:
 
 
 class ReachMap:
-    """Occupancy grids of where each arm's gripper can be placed.
+    """Occupancy grids of where each arm can make a top-down grasp.
 
-    Building one costs a couple of seconds, so callers should reuse it; the
-    module-level cache in :func:`reach_map` does that automatically.
+    Building one is expensive (minutes, dominated by the IK stage), so callers
+    should reuse it; :func:`reach_map` caches in process and each per-arm mask is
+    also cached on disk.
     """
 
     def __init__(self, model: mujoco.MjModel, data: mujoco.MjData):
         self.nx = int(round((GRID_X[1] - GRID_X[0]) / CELL)) + 1
         self.ny = int(round((GRID_Y[1] - GRID_Y[0]) / CELL)) + 1
+        self.model = model
+        self._data = data
         self._points = self._sweep(model, data)
+        self._solvers: Dict[str, IKSolver] = {}
         self._cache: Dict[Tuple[float, str, float], np.ndarray] = {}
+        self._arm_cache: Dict[Tuple[str, float], np.ndarray] = {}
+        self._geom_hash = _geometry_hash(model)
 
     @staticmethod
     def _sweep(model: mujoco.MjModel, data: mujoco.MjData) -> Dict[str, np.ndarray]:
@@ -106,7 +150,8 @@ class ReachMap:
                             out[arm].append(scratch.site_xpos[sites[arm]].copy())
         return {arm: np.asarray(v) for arm, v in out.items()}
 
-    def _arm_mask(self, arm: str, height: float) -> np.ndarray:
+    def _position_mask(self, arm: str, height: float) -> np.ndarray:
+        """Stage 1: cells the gripper site can occupy at all, in any orientation."""
         pts = self._points[arm]
         band = pts[np.abs(pts[:, 2] - height) <= Z_TOLERANCE]
         grid = np.zeros((self.nx, self.ny), dtype=bool)
@@ -114,9 +159,69 @@ class ReachMap:
         iy = np.round((band[:, 1] - GRID_Y[0]) / CELL).astype(int)
         ok = (ix >= 0) & (ix < self.nx) & (iy >= 0) & (iy < self.ny)
         grid[ix[ok], iy[ok]] = True
-        # Close first (the sweep is a point cloud, not a filled region), then erode
-        # by the safety margin so nothing lands on the boundary of the reach set.
+        # The sweep is a point cloud, not a filled region, so close it.
         return _morph(_morph(grid, CLOSE_RADIUS, True), CLOSE_RADIUS, False)
+
+    def top_down_ok(self, arm: str, xy: Sequence[float], height: float,
+                    *, seed: Optional[np.ndarray] = None) -> Tuple[bool, np.ndarray]:
+        """Whether ``arm`` can reach ``xy`` at ``height`` with the approach axis down.
+
+        Requires a solution at every yaw bin.  Returns ``(ok, q)`` where ``q`` is
+        the last solution found, usable as a warm start for a neighbouring cell.
+        """
+        solver = self._solvers.get(arm)
+        if solver is None:
+            solver = self._solvers[arm] = IKSolver(self.model, arm)
+        target = np.array([xy[0], xy[1], height])
+        last = seed
+        for k in range(IK_YAW_BINS):
+            q, info = solve_top_down(
+                solver, self._data, target, np.pi * k / IK_YAW_BINS, seed=last,
+                max_iters=IK_MAX_ITERS, pos_tol=IK_POS_TOL, rot_tol=IK_ROT_TOL)
+            if not info["converged"]:
+                return False, last if last is not None else q
+            last = q
+        return True, last
+
+    def _arm_mask(self, arm: str, height: float) -> np.ndarray:
+        """Stage 1 then stage 2, memoized in process and on disk."""
+        key = (arm, round(height, 4))
+        if key in self._arm_cache:
+            return self._arm_cache[key]
+
+        path = CACHE_DIR / self._geom_hash / f"{arm}_{key[1]:.4f}.npy"
+        if path.exists():
+            mask = np.load(path)
+            if mask.shape == (self.nx, self.ny):
+                self._arm_cache[key] = mask
+                return mask
+
+        coarse = self._position_mask(arm, height)
+        # Only cells on the table can ever hold a prop, so do not pay IK for the rest.
+        coarse &= self._table_mask()
+
+        mask = np.zeros_like(coarse)
+        warm = None
+        ix, iy = np.nonzero(coarse)
+        for i, j in zip(ix, iy):
+            xy = (i * CELL + GRID_X[0], j * CELL + GRID_Y[0])
+            ok, warm = self.top_down_ok(arm, xy, height, seed=warm)
+            mask[i, j] = ok
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(path, mask)
+        self._arm_cache[key] = mask
+        return mask
+
+    def _table_mask(self) -> np.ndarray:
+        gid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "table_top")
+        bid = self.model.geom_bodyid[gid]
+        centre = self.model.body_pos[bid][:2] + self.model.geom_pos[gid][:2]
+        half = self.model.geom_size[gid][:2]
+        xs = np.arange(self.nx) * CELL + GRID_X[0]
+        ys = np.arange(self.ny) * CELL + GRID_Y[0]
+        return ((np.abs(xs - centre[0]) <= half[0])[:, None]
+                & (np.abs(ys - centre[1]) <= half[1])[None, :])
 
     def mask(self, height: float, mode: str = "any", margin: float = REACH_MARGIN) -> np.ndarray:
         """Cells reachable at ``height`` by either arm (``any``) or both (``both``)."""
@@ -130,6 +235,22 @@ class ReachMap:
     def cells_to_xy(self, mask: np.ndarray) -> np.ndarray:
         ix, iy = np.nonzero(mask)
         return np.stack([ix * CELL + GRID_X[0], iy * CELL + GRID_Y[0]], axis=1)
+
+
+def _geometry_hash(model: mujoco.MjModel) -> str:
+    """Identify the kinematics the map depends on, so a stale cache is never reused.
+
+    Only fields that move the gripper site matter; the randomizer's masses,
+    colours and lights deliberately do not appear here.
+    """
+    h = hashlib.sha1()
+    for arr in (model.body_pos, model.body_quat, model.jnt_pos, model.jnt_axis,
+                model.jnt_range, model.jnt_type, model.jnt_bodyid,
+                model.site_pos, model.site_quat, model.site_bodyid):
+        h.update(np.ascontiguousarray(arr, dtype=np.float64).tobytes())
+    h.update(repr((CELL, GRID_X, GRID_Y, CLOSE_RADIUS, Z_TOLERANCE, SWEEP,
+                   IK_YAW_BINS, IK_POS_TOL, IK_ROT_TOL, IK_MAX_ITERS)).encode())
+    return h.hexdigest()[:16]
 
 
 _REACH_CACHE: Dict[int, Tuple[mujoco.MjModel, ReachMap]] = {}
