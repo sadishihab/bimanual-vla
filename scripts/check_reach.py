@@ -17,9 +17,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from control.ik import IKSolver, solve_top_down  # noqa: E402
 from control.primitives import grasp_pose  # noqa: E402
 from envs.randomize import IK_POS_TOL, IK_ROT_TOL, PROPS, randomize  # noqa: E402
-
-REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
-SCENE = REPO_ROOT / "scenes" / "bimanual_table.xml"
+from envs.scene import SCENE, load_scene  # noqa: E402
 
 
 def main() -> None:
@@ -28,7 +26,7 @@ def main() -> None:
     parser.add_argument("--scene", type=pathlib.Path, default=SCENE)
     args = parser.parse_args()
 
-    model = mujoco.MjModel.from_xml_path(str(args.scene))
+    model = load_scene(args.scene)
     data = mujoco.MjData(model)
     mujoco.mj_resetDataKeyframe(model, data, 0)
     randomize(model, data, args.seed)

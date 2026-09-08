@@ -10,9 +10,7 @@ import mujoco
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from envs.randomize import randomize  # noqa: E402
-
-REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
-SCENE = REPO_ROOT / "scenes" / "bimanual_table.xml"
+from envs.scene import SCENE, load_scene  # noqa: E402
 CAMERAS = ("overhead", "front")
 
 
@@ -36,7 +34,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    model = mujoco.MjModel.from_xml_path(str(args.scene))
+    model = load_scene(args.scene)
     data = mujoco.MjData(model)
 
     if args.keyframe:

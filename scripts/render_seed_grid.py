@@ -11,9 +11,7 @@ from PIL import Image, ImageDraw
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from envs.randomize import randomize  # noqa: E402
-
-REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
-SCENE = REPO_ROOT / "scenes" / "bimanual_table.xml"
+from envs.scene import SCENE, load_scene  # noqa: E402
 
 PAD = 8
 LABEL_H = 22
@@ -32,7 +30,7 @@ def main() -> None:
     parser.add_argument("--tile-height", type=int, default=330)
     args = parser.parse_args()
 
-    model = mujoco.MjModel.from_xml_path(str(args.scene))
+    model = load_scene(args.scene)
     data = mujoco.MjData(model)
     key_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
 

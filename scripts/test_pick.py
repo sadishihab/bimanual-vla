@@ -14,9 +14,7 @@ import mujoco
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from control.primitives import pick  # noqa: E402
 from envs.randomize import randomize  # noqa: E402
-
-REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
-SCENE = REPO_ROOT / "scenes" / "bimanual_table.xml"
+from envs.scene import SCENE, load_scene  # noqa: E402
 
 
 def main() -> None:
@@ -28,7 +26,7 @@ def main() -> None:
     parser.add_argument("--dump", action="store_true", help="print the full report as JSON")
     args = parser.parse_args()
 
-    model = mujoco.MjModel.from_xml_path(str(args.scene))
+    model = load_scene(args.scene)
     data = mujoco.MjData(model)
     mujoco.mj_resetDataKeyframe(model, data, 0)
     randomize(model, data, args.seed)
@@ -50,8 +48,19 @@ def main() -> None:
         else:
             line += " " * 58
         c = stage["contacts"]
-        line += f" | obj z {stage['object_z']:.4f} contacts table={c['table']} arm={c['arm']}"
+        g = stage["grip_force"]
+        line += (f" | obj z {stage['object_z']:.4f} contacts table={c['table']} arm={c['arm']}"
+                 f" | jaw {stage['jaw_gap'] * 1000:5.1f} mm"
+                 f" grip {g['fixed']:6.2f}/{g['moving']:6.2f} N")
         print(line)
+
+    if report["lift_trace"]:
+        print("  lift trace (grip force per Cartesian sub-step, fixed/moving jaw):")
+        for t in report["lift_trace"]:
+            g = t["grip_force"]
+            print(f"    step {t['step']:2d}  +{t['height'] * 1000:5.1f} mm"
+                  f"  obj z {t['object_z']:.4f}  jaw {t['jaw_gap'] * 1000:5.1f} mm"
+                  f"  grip {g['fixed']:6.2f} / {g['moving']:6.2f} N")
     print(f"  rest z {report['rest_z']:.4f} -> final z {report['final_z']:.4f}"
           f"  (rise {report['rise'] * 1000:+.1f} mm)")
     print(f"  final contacts table={report['contacts']['table']} arm={report['contacts']['arm']}")

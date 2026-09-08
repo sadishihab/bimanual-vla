@@ -4,28 +4,28 @@ The only primitive so far is :func:`pick`: a top-down grasp built from four
 waypoints -- above the object, descend, close, lift -- with the arm driven by
 its position actuators and the simulation stepped throughout.  Joint targets for
 each waypoint come from :mod:`control.ik`.
+
+The gripper is not on position control: it is commanded in torque, so the squeeze
+survives the lift instead of decaying as a servo settles.  :mod:`control.gripper`
+explains why, and :func:`envs.scene.load_scene` is what applies it -- a model
+loaded straight from the XML still has a position-controlled gripper and
+``pick`` will read its ctrl as radians.
 """
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import mujoco
 import numpy as np
 
+from control.gripper import GRIP_TORQUE, OPEN_TORQUE
 from control.ik import ARM_JOINTS, IKSolver, top_down_mat
 
-# Gripper actuator: the jaw closes at the low end of ctrlrange and opens toward
-# the high end (verified against the SO-101 model).
-GRIPPER_OPEN = 1.10
-GRIPPER_SHUT = -0.15     # hard stop, used only when there is nothing to hold
-# Commanding the hard stop on an object drives the servo to its full 3.35 N.m
-# against whatever is between the jaws: measured 6 mm of penetration into a 12 mm
-# handle, i.e. the jaws close straight through it, and the stored energy throws
-# the prop out on the next move.  Instead close to the object's own width less a
-# small squeeze, so the servo stalls on the object the way a real gripper does.
-GRIPPER_SQUEEZE = 0.002  # m of interference commanded into the object
-GRIPPER_CLEARANCE = 0.016  # m of total jaw daylight around the object on approach
+# Gripper commands are torques (see control.gripper): OPEN_TORQUE holds the jaw
+# back against its upper stop, GRIP_TORQUE is the squeeze.  There is no commanded
+# jaw *angle* any more -- the jaw stops where the stop or the object puts it,
+# which is the whole point.
 WIDE_OPEN = 0.10         # sentinel gap for "jaw is clear of the grasp region"
 
 # Standoff and lift stay inside the arm's top-down envelope, whose ceiling is
@@ -48,7 +48,12 @@ LIFT_THRESHOLD = 0.03    # m of net rise that counts as a successful lift
 SETTLE_TIME = 0.5
 APPROACH_TIME = 1.5
 DESCEND_TIME = 1.0
-CLOSE_TIME = 0.8
+# Closing is now a torque held until the jaw arrives, not a servo step, so it has
+# to be given the jaw's actual travel time.  The jaw retracts to its stop at
+# 1.745 rad and the fork's 12 mm bar is reached near 0 rad; against 0.6 N.m.s/rad
+# of joint damping, 0.8 N.m settles at about 1.2 rad/s, so ~1.5 s of sweep.
+CLOSE_RAMP_TIME = 0.25   # s to swing the command from open to squeeze
+CLOSE_TIME = 2.0         # s of held squeeze, sized to the sweep above
 LIFT_TIME = 1.5
 HOLD_TIME = 0.5
 
@@ -175,24 +180,50 @@ def _object_contacts(model: mujoco.MjModel, data: mujoco.MjData,
     return counts
 
 
-# ---------------------------------------------------------------------------
-# Motion
-# ---------------------------------------------------------------------------
+def grip_force(model: mujoco.MjModel, data: mujoco.MjData, bid: int,
+               arm: str) -> Dict[str, float]:
+    """Normal force each jaw presses on body ``bid`` with, in newtons.
+
+    Broken out per jaw rather than summed, because the sum cannot tell a grasp
+    from a shove: a real grasp squeezes, so the fixed finger and the moving jaw
+    read the same magnitude, while a one-sided push shows up as force on one jaw
+    and nothing on the other.  The contact normal force is the first component of
+    the contact-frame wrench.
+    """
+    obj = set(_body_geoms(model, bid))
+    jaws = {}
+    for label, body in (("fixed", f"{arm}_gripper"), ("moving", f"{arm}_moving_jaw_so101_v1")):
+        jbid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body)
+        if jbid < 0:
+            raise ValueError(f"scene has no body {body}")
+        jaws[label] = set(_body_geoms(model, jbid))
+
+    out = {"fixed": 0.0, "moving": 0.0}
+    wrench = np.zeros(6)
+    for i in range(data.ncon):
+        pair = {data.contact[i].geom1, data.contact[i].geom2}
+        if len(pair) < 2 or not pair & obj:
+            continue
+        other = (pair - obj).pop()
+        for label, geoms in jaws.items():
+            if other in geoms:
+                mujoco.mj_contactForce(model, data, i, wrench)
+                out[label] += abs(float(wrench[0]))
+    return out
 
 
-def _jaw_gap(model: mujoco.MjModel, scratch: mujoco.MjData, arm: str,
-             site: int, jaw_q: float) -> float:
-    """Opening between the jaw faces, in metres, at gripper joint angle ``jaw_q``.
+def jaw_gap(model: mujoco.MjModel, data: mujoco.MjData, arm: str, site: int) -> float:
+    """Opening between the jaw faces, in metres, for the pose currently in ``data``.
 
     Measured off the collision meshes rather than assumed: the moving jaw swings
     on an arc, so the gap is not linear in the joint angle.  Only vertices near
-    the grasp point count -- the jaw bodies extend well behind it.
+    the grasp point count -- the jaw bodies extend well behind it.  Under torque
+    control this is the only readout of where the jaw actually ended up, so it is
+    recorded at every stage: a gap that stops at the object's width is a grasp, a
+    gap that runs down to the hard stop is an empty hand.
     """
-    jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, f"{arm}_gripper")
-    scratch.qpos[model.jnt_qposadr[jid]] = jaw_q
-    mujoco.mj_kinematics(model, scratch)
-    origin = scratch.site_xpos[site]
-    rot = scratch.site_xmat[site].reshape(3, 3)
+    origin = data.site_xpos[site]
+    rot = data.site_xmat[site].reshape(3, 3)
     approach, opening = rot[:, 0], rot[:, 2]
 
     spans = {}
@@ -205,7 +236,7 @@ def _jaw_gap(model: mujoco.MjModel, scratch: mujoco.MjData, arm: str,
                 continue
             a, n = model.mesh_vertadr[mesh], model.mesh_vertnum[mesh]
             verts = model.mesh_vert[a:a + n].astype(float)
-            world = scratch.geom_xpos[gid] + verts @ scratch.geom_xmat[gid].reshape(3, 3).T
+            world = data.geom_xpos[gid] + verts @ data.geom_xmat[gid].reshape(3, 3).T
             local = world - origin
             pts.append(local[np.abs(local @ approach) < 0.025] @ opening)
         spans[body] = np.concatenate(pts) if pts else np.empty(0)
@@ -217,25 +248,9 @@ def _jaw_gap(model: mujoco.MjModel, scratch: mujoco.MjData, arm: str,
     return float(moving.min() - fixed.max())
 
 
-def gripper_angle_for(model: mujoco.MjModel, arm: str, gap: float,
-                      site: int, iters: int = 24) -> float:
-    """Gripper joint angle giving a jaw opening of ``gap`` metres.
-
-    Bisection on :func:`_jaw_gap`, which is monotone in the joint angle.  Falls
-    back to the hard stop when the requested gap is below what the jaws can reach.
-    """
-    scratch = mujoco.MjData(model)
-    lo, hi = float(model.jnt_range[mujoco.mj_name2id(
-        model, mujoco.mjtObj.mjOBJ_JOINT, f"{arm}_gripper")][0]), GRIPPER_OPEN
-    if _jaw_gap(model, scratch, arm, site, lo) >= gap:
-        return lo
-    for _ in range(iters):
-        mid = 0.5 * (lo + hi)
-        if _jaw_gap(model, scratch, arm, site, mid) < gap:
-            lo = mid
-        else:
-            hi = mid
-    return 0.5 * (lo + hi)
+# ---------------------------------------------------------------------------
+# Motion
+# ---------------------------------------------------------------------------
 
 
 def _arm_actuators(model: mujoco.MjModel, arm: str) -> Tuple[np.ndarray, int]:
@@ -257,7 +272,9 @@ def _ramp(model: mujoco.MjModel, data: mujoco.MjData, act: np.ndarray, grip: int
     """Interpolate the arm's ctrl to the given targets, stepping the sim each tick.
 
     ``None`` targets hold whatever that channel is currently commanding, so the
-    gripper can be driven without disturbing the arm and vice versa.
+    gripper can be driven without disturbing the arm and vice versa.  ``q_target``
+    is in radians (the arm is on position control) and ``grip_target`` in
+    newton-metres (the gripper is not); both are clipped to their ctrlrange.
     """
     steps = max(1, int(round(duration / model.opt.timestep)))
     q_start = data.ctrl[act].copy()
@@ -276,7 +293,8 @@ def _ramp(model: mujoco.MjModel, data: mujoco.MjData, act: np.ndarray, grip: int
 
 def _move_line(model: mujoco.MjModel, data: mujoco.MjData, act: np.ndarray, grip: int,
                solver: IKSolver, start: np.ndarray, end: np.ndarray, yaw: float,
-               duration: float, steps: int = CARTESIAN_STEPS) -> Dict[str, object]:
+               duration: float, steps: int = CARTESIAN_STEPS,
+               probe: Optional[Callable[[int], None]] = None) -> Dict[str, object]:
     """Drive the gripper site along a straight line, re-solving IK at each step.
 
     Interpolating joint targets between two waypoints lets the tool frame bow
@@ -291,6 +309,8 @@ def _move_line(model: mujoco.MjModel, data: mujoco.MjData, act: np.ndarray, grip
         point = start + (end - start) * (k / steps)
         q, info = solver.solve(data, point, top_down_mat(yaw))
         _ramp(model, data, act, grip, q, None, duration / steps)
+        if probe is not None:
+            probe(k)
     return info
 
 
@@ -343,30 +363,46 @@ def pick(model: mujoco.MjModel, data: mujoco.MjData, arm: str,
             r["site_err"] = float(np.linalg.norm(data.site_xpos[solver.site] - goal))
         r["object_z"] = float(data.xpos[bid][2])
         r["contacts"] = _object_contacts(model, data, bid)
+        r["jaw_gap"] = jaw_gap(model, data, arm, solver.site)
+        r["grip_force"] = grip_force(model, data, bid, arm)
         stages.append(r)
 
     # Approach through free space above the object, opening the jaws on the way.
-    close_to = gripper_angle_for(model, arm, geom["grasp_width"] - GRIPPER_SQUEEZE,
-                                 solver.site)
-    # Open fully. Opening only just past the object was measured worse: the moving
-    # jaw sits lower on a tighter arc and grazes the prop during the descent,
-    # taking the dish's descend error from 0.9 mm to 8.5 mm.
-    open_to = GRIPPER_OPEN
-    geom["close_ctrl"], geom["open_ctrl"] = close_to, open_to
+    # There is no open *angle* to choose any more: the opening torque runs the jaw
+    # back to its stop at 1.745 rad, which is further open than the 1.10 rad the
+    # position servo used to be given, and further open is the safe direction --
+    # the moving jaw's tip retracts from 27 mm to 65 mm behind the grasp point, so
+    # it cannot graze the prop on the way down.
+    geom["open_torque"], geom["grip_torque"] = OPEN_TORQUE, GRIP_TORQUE
 
     q, ik = solver.solve(data, standoff, top_down_mat(yaw))
-    _ramp(model, data, act, grip, q, open_to, APPROACH_TIME)
+    _ramp(model, data, act, grip, q, OPEN_TORQUE, APPROACH_TIME)
     record("approach", ik, standoff)
 
     # Straight down onto the grasp point, jaws held open and clear of the object.
     ik = _move_line(model, data, act, grip, solver, standoff, target, yaw, DESCEND_TIME)
     record("descend", ik, target)
 
-    _ramp(model, data, act, grip, None, close_to, CLOSE_TIME)
+    # Swing the command over to the squeeze, then hold it while the jaw sweeps in.
+    _ramp(model, data, act, grip, None, GRIP_TORQUE, CLOSE_RAMP_TIME)
+    _ramp(model, data, act, grip, None, None, CLOSE_TIME)
     record("close", None, None)
 
     # Straight back up, so a successful grasp is not levered against the table.
-    ik = _move_line(model, data, act, grip, solver, target, lifted_to, yaw, LIFT_TIME)
+    # The squeeze is sampled at every sub-step: whether the torque command holds
+    # its force through the motion is the whole question this primitive failed on.
+    trace: List[Dict[str, object]] = []
+
+    def sample(k: int) -> None:
+        f = grip_force(model, data, bid, arm)
+        trace.append({"step": k,
+                      "height": float(data.site_xpos[solver.site][2] - target[2]),
+                      "object_z": float(data.xpos[bid][2]),
+                      "jaw_gap": jaw_gap(model, data, arm, solver.site),
+                      "grip_force": f})
+
+    ik = _move_line(model, data, act, grip, solver, target, lifted_to, yaw, LIFT_TIME,
+                    probe=sample)
     record("lift", ik, lifted_to)
 
     _ramp(model, data, act, grip, None, None, HOLD_TIME)
@@ -389,4 +425,5 @@ def pick(model: mujoco.MjModel, data: mujoco.MjData, arm: str,
         "contacts": contacts,
         "lifted": lifted,
         "stages": stages,
+        "lift_trace": trace,
     }

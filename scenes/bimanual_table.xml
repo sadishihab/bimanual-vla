@@ -143,7 +143,10 @@
   </worldbody>
 
   <!-- Ready pose: both arms raised over the table, grippers ~12 cm above the top.
-       qpos is [12 arm joints | plate | mug | spoon | fork free joints]. -->
+       qpos is [12 arm joints | plate | mug | spoon | fork free joints].
+       The two gripper ctrl entries below are in radians only for the raw XML.
+       envs.scene.load_scene puts the grippers on torque control and rewrites them
+       to control.gripper.OPEN_TORQUE, since ctrl is newton-metres after that. -->
   <keyframe>
     <key name="home"
          qpos="0 -0.6 1.3 -0.6 0 0.6  0 -0.6 1.3 -0.6 0 0.6  0.08 0 0.752 1 0 0 0  0.22 -0.26 0.752 1 0 0 0  0.08 -0.28 0.752 1 0 0 0  0.08 0.28 0.752 1 0 0 0"
