@@ -323,9 +323,11 @@ PROPS: Tuple[PropSpec, ...] = (
              (0.03, 0.09), (0.4, 1.2), (0.005, 0.050), (0.05, 0.45), (0.70, 1.00)),
     PropSpec("mug", "mug_mat", 0.032, 0.752, 0.782, "any",
              (0.05, 0.15), (0.5, 1.3), (0.005, 0.050), (0.45, 0.90), (0.45, 0.90)),
-    PropSpec("spoon", "spoon_mat", 0.075, 0.752, 0.774, "any",
+    # 0.035 is the 65 mm piece's half-length about its body origin, down from
+    # 0.075 when it was 136 mm long.
+    PropSpec("spoon", "spoon_mat", 0.035, 0.752, 0.774, "any",
              (0.01, 0.04), (0.3, 1.0), (0.002, 0.020), (0.10, 0.60), (0.50, 0.95)),
-    PropSpec("fork", "fork_mat", 0.075, 0.752, 0.774, "any",
+    PropSpec("fork", "fork_mat", 0.035, 0.752, 0.774, "any",
              (0.01, 0.04), (0.3, 1.0), (0.002, 0.020), (0.10, 0.60), (0.50, 0.95)),
 )
 

@@ -19,7 +19,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import mujoco
 import numpy as np
 
-from control.gripper import GRIP_TORQUE, OPEN_TORQUE
+from control.gripper import (GRIP_TORQUE, GRIP_TRIGGER, HOLD_TORQUE, OPEN_TORQUE)
 from control.ik import (ARM_JOINTS, ROT_TOL, IKSolver, reachable_above,
                         reachable_toward, top_down_mat)
 
@@ -67,6 +67,8 @@ DESCEND_TIME = 1.0
 # of joint damping, 0.8 N.m settles at about 1.2 rad/s, so ~1.5 s of sweep.
 CLOSE_RAMP_TIME = 0.25   # s to swing the command from open to squeeze
 CLOSE_TIME = 2.0         # s of held squeeze, sized to the sweep above
+CLOSE_SLICE = 0.02       # s between checks for the jaws having loaded up
+EASE_TIME = 0.15         # s to drop from the closing torque to the holding one
 LIFT_TIME = 1.5
 HOLD_TIME = 0.5
 
@@ -507,6 +509,29 @@ def best_arm(model: mujoco.MjModel, data: mujoco.MjData,
     return best[1], best[2]
 
 
+def _squeeze(model: mujoco.MjModel, data: mujoco.MjData, act: np.ndarray, grip: int,
+             arm: str, bid: int, duration: float) -> bool:
+    """Close the jaws, then ease the command once they have loaded up.
+
+    Closing and holding want different torques.  The closing one has to sweep the
+    jaw all the way in from its stop against the joint's damping; the holding one
+    only has to carry the object.  Leaving the closing torque on crushes through
+    anything whose contact is soft enough, and how soft that is depends on the
+    object -- see :data:`control.gripper.HOLD_TORQUE`.
+
+    Returns whether the jaws ever loaded up, which is the difference between a
+    grasp that was eased and one that closed on nothing.
+    """
+    _ramp(model, data, act, grip, None, GRIP_TORQUE, CLOSE_RAMP_TIME)
+    eased = False
+    for _ in range(max(1, int(round(duration / CLOSE_SLICE)))):
+        _ramp(model, data, act, grip, None, None, CLOSE_SLICE)
+        if not eased and min(grip_force(model, data, bid, arm).values()) >= GRIP_TRIGGER:
+            _ramp(model, data, act, grip, None, HOLD_TORQUE, EASE_TIME)
+            eased = True
+    return eased
+
+
 def pick(model: mujoco.MjModel, data: mujoco.MjData, arm: str,
          object_name: str) -> Dict[str, object]:
     """Run a scripted top-down pick of ``object_name`` with ``arm``.
@@ -572,9 +597,7 @@ def pick(model: mujoco.MjModel, data: mujoco.MjData, arm: str,
     ik = _move_line(model, data, act, grip, solver, standoff, target, yaw, DESCEND_TIME)
     record("descend", ik, target)
 
-    # Swing the command over to the squeeze, then hold it while the jaw sweeps in.
-    _ramp(model, data, act, grip, None, GRIP_TORQUE, CLOSE_RAMP_TIME)
-    _ramp(model, data, act, grip, None, None, CLOSE_TIME)
+    geom["eased"] = _squeeze(model, data, act, grip, arm, bid, CLOSE_TIME)
     record("close", None, None)
 
     # Straight back up, so a successful grasp is not levered against the table.

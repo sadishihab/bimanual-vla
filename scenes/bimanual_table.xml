@@ -115,25 +115,38 @@
     <!-- Spoon and fork on a riser: the handle is lifted to 19-29 mm on a small
          pedestal at its far end, so the jaws can straddle a 12 mm bar with the
          fingers clear of the table.  The bowl and tines still rest on the top,
-         which keeps the silhouette reading as cutlery. -->
+         which keeps the silhouette reading as cutlery.
+
+         Both are 65 mm end to end, down from 136.  At full length the grasp bar
+         sat 98 mm from the far end, and lifting the handle only pivoted the piece
+         about that end: measured at -39 to -42 degrees with the bowl or all four
+         tines still on the table while the handle was 42-46 mm up, which is the
+         whole lift the arm has.  Clearing a piece held near one end takes a lift
+         of order its own length, and the top-down ceiling is 93 mm above the
+         table, so the piece had to come down to the lift rather than the other
+         way round.  At 65 mm the grasp bar is 45 mm from the far end.
+
+         The grasp bar keeps its section exactly -- 12 mm across the jaws, 10 mm
+         tall, spanning 19-29 mm above the table -- so the seating in the jaw pads
+         is unchanged and only the overhang shrinks. -->
     <body name="spoon" pos="0.08 -0.28 0.7520" childclass="prop">
       <freejoint name="spoon_free"/>
-      <geom name="spoon_riser" type="box" pos="-0.058 0 0.0095" size="0.008 0.006 0.0095" material="spoon_mat"/>
-      <geom name="spoon_grasp" type="box" pos="-0.028 0 0.024" size="0.034 0.006 0.005" material="spoon_mat"/>
-      <geom name="spoon_neck" type="capsule" fromto="0.004 0 0.020 0.022 0 0.006" size="0.004" material="spoon_mat"/>
-      <geom name="spoon_bowl" type="ellipsoid" pos="0.044 0 0.005" size="0.026 0.017 0.005" material="spoon_mat"/>
+      <geom name="spoon_riser" type="box" pos="-0.026 0 0.0095" size="0.006 0.006 0.0095" material="spoon_mat"/>
+      <geom name="spoon_grasp" type="box" pos="-0.012 0 0.024" size="0.016 0.006 0.005" material="spoon_mat"/>
+      <geom name="spoon_neck" type="capsule" fromto="0.004 0 0.020 0.012 0 0.006" size="0.003" material="spoon_mat"/>
+      <geom name="spoon_bowl" type="ellipsoid" pos="0.023 0 0.004" size="0.010 0.011 0.004" material="spoon_mat"/>
     </body>
 
     <body name="fork" pos="0.08 0.28 0.7520" childclass="prop">
       <freejoint name="fork_free"/>
-      <geom name="fork_riser" type="box" pos="-0.058 0 0.0095" size="0.008 0.006 0.0095" material="fork_mat"/>
-      <geom name="fork_grasp" type="box" pos="-0.028 0 0.024" size="0.034 0.006 0.005" material="fork_mat"/>
-      <geom name="fork_neck" type="capsule" fromto="0.004 0 0.020 0.022 0 0.006" size="0.004" material="fork_mat"/>
-      <geom name="fork_base" type="box" pos="0.032 0 0.004" size="0.010 0.013 0.004" material="fork_mat"/>
-      <geom name="fork_tine1" type="box" pos="0.054 -0.0093 0.004" size="0.014 0.0028 0.003" material="fork_mat"/>
-      <geom name="fork_tine2" type="box" pos="0.054 -0.0031 0.004" size="0.014 0.0028 0.003" material="fork_mat"/>
-      <geom name="fork_tine3" type="box" pos="0.054  0.0031 0.004" size="0.014 0.0028 0.003" material="fork_mat"/>
-      <geom name="fork_tine4" type="box" pos="0.054  0.0093 0.004" size="0.014 0.0028 0.003" material="fork_mat"/>
+      <geom name="fork_riser" type="box" pos="-0.026 0 0.0095" size="0.006 0.006 0.0095" material="fork_mat"/>
+      <geom name="fork_grasp" type="box" pos="-0.012 0 0.024" size="0.016 0.006 0.005" material="fork_mat"/>
+      <geom name="fork_neck" type="capsule" fromto="0.004 0 0.020 0.012 0 0.006" size="0.003" material="fork_mat"/>
+      <geom name="fork_base" type="box" pos="0.015 0 0.004" size="0.005 0.010 0.004" material="fork_mat"/>
+      <geom name="fork_tine1" type="box" pos="0.027 -0.0072 0.004" size="0.007 0.0022 0.003" material="fork_mat"/>
+      <geom name="fork_tine2" type="box" pos="0.027 -0.0024 0.004" size="0.007 0.0022 0.003" material="fork_mat"/>
+      <geom name="fork_tine3" type="box" pos="0.027  0.0024 0.004" size="0.007 0.0022 0.003" material="fork_mat"/>
+      <geom name="fork_tine4" type="box" pos="0.027  0.0072 0.004" size="0.007 0.0022 0.003" material="fork_mat"/>
     </body>
 
     <!-- ================= Cameras =================

@@ -38,7 +38,24 @@ import numpy as np
 # the jaw retracts, not where it ends up -- that is the joint stop), and the
 # squeeze only has to beat the weight of a 30 g fork many times over.
 OPEN_TORQUE = 1.0     # N.m
-GRIP_TORQUE = -0.8    # N.m
+GRIP_TORQUE = -0.8    # N.m, the closing sweep
+# Once the jaws have loaded, the command eases off.  The closing torque is sized
+# to sweep the jaw in from its stop against 0.6 N.m.s/rad of damping, and that is
+# far more than any of these props needs held: left on, it crushes through.  How
+# much penetration it buys depends on the object, because MuJoCo's time-constant
+# solref makes contact stiffness scale with the effective mass at the contact --
+# the 136 mm spoon stopped at 2.5 mm into a 12 mm bar, and the 65 mm one, with a
+# fifth of the rotational inertia, went straight through it to the hard stop and
+# ejected the piece.  Holding is a different job from closing, so it gets its own
+# number, sized by what the grasp has to carry rather than by what the jaw has to
+# overcome to arrive: 0.20 N.m is about 2.7 N a jaw, so 5.4 N of friction at mu=1
+# against the 1.5 N of the heaviest prop and the 0.4 N of the lightest.  Too much
+# here is not merely wasteful, it ejects: the jaws close past parallel on anything
+# narrower than their 15.8 mm reference gap, and the wedge that makes flicks a
+# light piece straight out.  Measured on the 65 mm spoon at 11 g -- 0.35 N.m loses
+# it after one lift sub-step of twelve, 0.20 N.m carries it the whole way.
+HOLD_TORQUE = -0.20   # N.m
+GRIP_TRIGGER = 2.0    # N on both jaws before easing off
 
 _ARMS = ("left", "right")
 
