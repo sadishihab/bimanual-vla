@@ -68,6 +68,23 @@ MIN_FINGER_Z = 0.010     # m above the table top, so the jaws clear the surface
 JAW_CLEARANCE = 0.004    # m of daylight between the fixed finger and the object edge
 LIFT_THRESHOLD = 0.03    # m of net rise that counts as a successful lift
 
+# Placing: how high above the table the object's own origin is let go from, and
+# how far the tool retreats afterwards before anything else happens.
+PLACE_CLEARANCE = 0.004  # m of drop from release to rest
+RELEASE_TIME = 0.5       # s to swing the jaws back open
+RETREAT_HEIGHT = 0.05    # m of straight-up retreat after letting go
+PLACE_TOL = 0.020        # m; how close to its goal a placed prop has to land
+# The place legs are timed by how far they go rather than given a fixed duration.
+# A fixed one is wrong at both ends: the leg from the transit's via point down to
+# the standoff is often a millimetre or two and was being given a second and a
+# half of it, and a prop under a constant squeeze creeps out of the jaws the whole
+# time it is held -- measured, a fork slid 6.4 mm down the pads over one carry and
+# was gone by the end of the next leg.  Time under load is the thing to spend
+# sparingly.
+TOOL_SPEED = 0.10        # m/s along a carried leg
+MIN_LEG_TIME = 0.15      # s, so a very short leg is still ramped rather than stepped
+MAX_LEG_TIME = 1.5       # s
+
 # Waypoint durations in seconds; converted to steps with the model timestep.
 SETTLE_TIME = 0.5
 OPEN_TIME = 0.4          # s to swing the jaws back to their stop before moving
@@ -384,6 +401,76 @@ def _move_line(model: mujoco.MjModel, data: mujoco.MjData, act: np.ndarray, grip
     return info
 
 
+def held_object(model: mujoco.MjModel, data: mujoco.MjData, arm: str) -> Optional[int]:
+    """Which prop the jaws are holding, or ``None``.
+
+    A prop counts as held when both pads are on it, which is what distinguishes a
+    grasp from something merely leant against.  Nothing else in the scene can be
+    in the jaws, so the search is over the props.
+    """
+    for bid in prop_bodies(model):
+        force = grip_force(model, data, bid, arm)
+        if min(force.values()) > 0.0:
+            return bid
+    return None
+
+
+def _grip_transform(model: mujoco.MjModel, data: mujoco.MjData, arm: str,
+                    bid: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Pose of the held body in the gripper body's frame, so it can be carried."""
+    gb = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"{arm}_gripper")
+    rot = data.xmat[gb].reshape(3, 3)
+    return rot.T @ (data.xpos[bid] - data.xpos[gb]), rot.T @ data.xmat[bid].reshape(3, 3)
+
+
+def _carry(model: mujoco.MjModel, scratch: mujoco.MjData, arm: str, bid: int,
+           rel_pos: np.ndarray, rel_mat: np.ndarray, qadr: int) -> None:
+    """Move the held body with the gripper, as a rigid grasp would."""
+    gb = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"{arm}_gripper")
+    rot = scratch.xmat[gb].reshape(3, 3)
+    quat = np.zeros(4)
+    mujoco.mju_mat2Quat(quat, np.ascontiguousarray(rot @ rel_mat).ravel())
+    scratch.qpos[qadr:qadr + 3] = scratch.xpos[gb] + rot @ rel_pos
+    scratch.qpos[qadr + 3:qadr + 7] = quat
+
+
+def carry_fouls(model: mujoco.MjModel, data: mujoco.MjData, solver: IKSolver,
+                arm: str, start: np.ndarray, end: np.ndarray, yaw: float, bid: int,
+                steps: int = CARTESIAN_STEPS, rot_tol: float = ROT_TOL) -> int:
+    """Sub-steps where the arm, or the thing it is carrying, hits something else.
+
+    The empty-handed check in :func:`path_fouls` is not the right question once
+    there is a prop in the jaws: the assembly that has to fit through the gap is
+    the gripper *plus* whatever it holds, and for a mug that is another 34 mm
+    hanging below the tool.  So the held body is carried along with the gripper at
+    the pose it was grasped at, and what counts as a foul is it touching the table
+    or another prop -- its contact with the pads is the grasp, not a collision.
+    """
+    scratch = mujoco.MjData(model)
+    scratch.qpos[:] = data.qpos
+    rel_pos, rel_mat = _grip_transform(model, data, arm, bid)
+    jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT,
+                            mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, bid) + "_free")
+    qadr = model.jnt_qposadr[jid]
+    others = [b for b in prop_bodies(model) if b != bid]
+
+    fouls = 0
+    q, _ = solver.solve(data, start, top_down_mat(yaw), rot_tol=rot_tol)
+    for k in range(steps + 1):
+        point = start + (end - start) * (k / steps)
+        point, _ = reachable_toward(solver, scratch, point, end, top_down_mat(yaw),
+                                    rot_tol=rot_tol)
+        q, _ = solver.solve(scratch, point, top_down_mat(yaw), seed=q, rot_tol=rot_tol)
+        scratch.qpos[solver.qadr] = q
+        mujoco.mj_kinematics(model, scratch)
+        _carry(model, scratch, arm, bid, rel_pos, rel_mat, qadr)
+        mujoco.mj_forward(model, scratch)
+        carried = _object_contacts(model, scratch, bid)
+        fouls += bool(carried["table"] or carried["other"]
+                      or any(_object_contacts(model, scratch, b)["arm"] for b in others))
+    return fouls
+
+
 def prop_bodies(model: mujoco.MjModel) -> List[int]:
     """Every body that is a loose prop, found by its free joint rather than by name."""
     return sorted({int(model.jnt_bodyid[j]) for j in range(model.njnt)
@@ -546,8 +633,8 @@ def plan_grasp(model: mujoco.MjModel, data: mujoco.MjData, arm: str,
             "fouls": int(fouls)}
 
 
-def best_arm(model: mujoco.MjModel, data: mujoco.MjData,
-             object_name: str) -> Tuple[str, Dict[str, object]]:
+def best_arm(model: mujoco.MjModel, data: mujoco.MjData, object_name: str,
+             arms: Sequence[str] = ("left", "right")) -> Tuple[str, Dict[str, object]]:
     """Which arm should pick ``object_name``: the one that can grasp it and lift highest.
 
     Reach is not symmetric -- the props are placed by a per-arm reach map, and a
@@ -556,9 +643,12 @@ def best_arm(model: mujoco.MjModel, data: mujoco.MjData,
     by a descent corridor clear of the prop, then by lift height, then by grasp
     residual.  Residual alone is useless as a tie-break here: on the plate the two
     arms differ by 0.01 mm and one of them drives straight into it.
+
+    ``arms`` narrows the choice, which is how a caller that also has to *put the
+    prop somewhere* keeps the two halves of the job on one arm.
     """
     best = None
-    for arm in ("left", "right"):
+    for arm in arms:
         plan = plan_grasp(model, data, arm, object_name)
         score = (not plan["grasp_ok"], plan["fouls"], -plan["lift_height"],
                  plan["geometry"]["grasp_ik"]["at_grasp"])
@@ -702,4 +792,167 @@ def pick(model: mujoco.MjModel, data: mujoco.MjData, arm: str,
         "lifted": lifted,
         "stages": stages,
         "lift_trace": trace,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Placing
+# ---------------------------------------------------------------------------
+
+
+def _leg_time(start: np.ndarray, end: np.ndarray) -> float:
+    """How long to spend on a leg, from its length at a fixed tool speed."""
+    return float(np.clip(np.linalg.norm(np.asarray(end) - np.asarray(start)) / TOOL_SPEED,
+                         MIN_LEG_TIME, MAX_LEG_TIME))
+
+
+def _carry_drop(model: mujoco.MjModel, data: mujoco.MjData, solver: IKSolver,
+                bid: int) -> float:
+    """How far below the tool the held prop's lowest point hangs, in metres."""
+    site_z = float(data.site_xpos[solver.site][2])
+    low = min(float(data.geom_xpos[g][2] - model.geom_rbound[g])
+              for g in _body_geoms(model, bid))
+    return site_z - low
+
+
+def plan_place(model: mujoco.MjModel, data: mujoco.MjData, arm: str,
+               target_xy: Sequence[float]) -> Optional[Dict[str, object]]:
+    """Where to fly to let the held prop down at ``target_xy``.
+
+    Returns ``None`` when the jaws are empty, which is the honest answer to
+    "place what?".  The tool keeps the orientation it grasped at, so the offset
+    from tool to prop is a constant translation and the release pose follows from
+    where the prop has to end up rather than from where the tool has to be.
+    """
+    bid = held_object(model, data, arm)
+    if bid is None:
+        return None
+
+    solver = IKSolver(model, arm)
+    site = data.site_xpos[solver.site].copy()
+    rot = data.site_xmat[solver.site].reshape(3, 3)
+    yaw = float(np.arctan2(rot[1, 2], rot[0, 2]))      # site +z is the opening axis
+    offset = data.xpos[bid] - site
+    drop = _carry_drop(model, data, solver, bid)
+
+    release = np.array([target_xy[0] - offset[0], target_xy[1] - offset[1],
+                        _table_top_z(model) + PLACE_CLEARANCE - offset[2]])
+    _, r_info = solver.solve(data, release, top_down_mat(yaw))
+
+    above, a_info = reachable_above(solver, data, release, yaw, APPROACH_HEIGHT,
+                                    floor=MIN_STANDOFF)
+    # The transit has to clear the other props by the height of whatever is
+    # hanging from the jaws, not merely by the tool's own.
+    others = [b for b in prop_bodies(model) if b != bid]
+    ceiling = max([float(data.geom_xpos[g][2] + model.geom_rbound[g])
+                   for b in others for g in _body_geoms(model, b)] or [_table_top_z(model)])
+    via = np.array([above[0], above[1],
+                    max(above[2], ceiling + TRANSIT_CLEARANCE + drop, site[2])])
+    via, _ = reachable_toward(solver, data, via, above, top_down_mat(yaw),
+                              rot_tol=TRANSIT_ROT_TOL)
+
+    fouls = (carry_fouls(model, data, solver, arm, site, via, yaw, bid,
+                         steps=TRANSIT_STEPS, rot_tol=TRANSIT_ROT_TOL)
+             + carry_fouls(model, data, solver, arm, via, above, yaw, bid,
+                           rot_tol=TRANSIT_ROT_TOL)
+             + carry_fouls(model, data, solver, arm, above, release, yaw, bid))
+    retreat, t_info = reachable_above(solver, data, release, yaw, RETREAT_HEIGHT,
+                                      floor=MIN_STANDOFF)
+    return {
+        "solver": solver, "body": bid, "yaw": yaw, "via": via, "above": above,
+        "release": release, "retreat": retreat, "carry_drop": drop, "fouls": int(fouls),
+        "release_ok": bool(r_info["converged"]), "release_ik": r_info["pos_err"],
+        "approach": {k: a_info[k] for k in ("height", "clamped", "floor_ok")},
+        "retreat_height": {k: t_info[k] for k in ("height", "clamped", "floor_ok")},
+        "transit_clear": bool(via[2] >= ceiling + TRANSIT_CLEARANCE + drop),
+    }
+
+
+def place(model: mujoco.MjModel, data: mujoco.MjData, arm: str,
+          target_xy: Sequence[float]) -> Dict[str, object]:
+    """Put whatever ``arm`` is holding down at ``target_xy``.
+
+    Transit above everything else on the table, descend onto the spot, open, and
+    retreat straight up so the jaws do not drag what they just let go of.  The
+    legs are the same two-phase, clamped, corridor-checked motions the pick uses;
+    the difference is that the moving assembly is the gripper plus its load, so
+    the clearances are measured from the load's lowest point.
+    """
+    act, grip = _arm_actuators(model, arm)
+    plan = plan_place(model, data, arm, target_xy)
+    if plan is None:
+        return {"arm": arm, "object": None, "placed": False, "reason": "nothing held",
+                "target_xy": list(map(float, target_xy)), "final_xy": None,
+                "final_z": None, "error": float("inf"), "carry_drop": 0.0,
+                "fouls": 0, "release_ok": False, "transit_clear": False,
+                "approach": None, "contacts": None, "stages": []}
+
+    solver, bid, yaw = plan["solver"], plan["body"], plan["yaw"]
+    name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, bid)
+    if not plan["release_ok"]:
+        # Flying at a release the arm cannot reach does not put the prop down
+        # somewhere slightly wrong, it puts it down somewhere else entirely: the
+        # fork missed its goal by 138 mm that way.  Better to hold on and say so.
+        return {"arm": arm, "object": name, "placed": False,
+                "reason": f"release pose off by {plan['release_ik'] * 1000:.1f} mm",
+                "target_xy": list(map(float, target_xy)), "final_xy": None,
+                "final_z": None, "error": float("inf"),
+                "carry_drop": plan["carry_drop"], "fouls": plan["fouls"],
+                "release_ok": False, "transit_clear": plan["transit_clear"],
+                "approach": plan["approach"], "contacts": None, "stages": []}
+    stages: List[Dict[str, object]] = []
+
+    def record(stage: str, ik: Optional[Dict[str, object]],
+               goal: Optional[np.ndarray]) -> None:
+        r: Dict[str, object] = {"stage": stage, "object_z": float(data.xpos[bid][2]),
+                                "object_xy": data.xpos[bid][:2].tolist(),
+                                "contacts": _object_contacts(model, data, bid),
+                                "jaw_gap": jaw_gap(model, data, arm, solver.site),
+                                "grip_force": grip_force(model, data, bid, arm)}
+        if ik is not None:
+            r["ik"] = ik
+            r["site_err"] = float(np.linalg.norm(data.site_xpos[solver.site] - goal))
+        stages.append(r)
+
+    here = data.site_xpos[solver.site].copy()
+    _move_line(model, data, act, grip, solver, here, plan["via"], yaw,
+               _leg_time(here, plan["via"]), steps=TRANSIT_STEPS, clamp=True,
+               rot_tol=TRANSIT_ROT_TOL,
+               start_mat=data.site_xmat[solver.site].reshape(3, 3).copy())
+    ik = _move_line(model, data, act, grip, solver, plan["via"], plan["above"], yaw,
+                    _leg_time(plan["via"], plan["above"]), clamp=True,
+                    rot_tol=TRANSIT_ROT_TOL)
+    record("carry", ik, plan["above"])
+
+    ik = _move_line(model, data, act, grip, solver, plan["above"], plan["release"],
+                    yaw, _leg_time(plan["above"], plan["release"]))
+    record("descend", ik, plan["release"])
+
+    _ramp(model, data, act, grip, None, OPEN_TORQUE, RELEASE_TIME)
+    record("release", None, None)
+
+    ik = _move_line(model, data, act, grip, solver, plan["release"], plan["retreat"],
+                    yaw, _leg_time(plan["release"], plan["retreat"]))
+    record("retreat", ik, plan["retreat"])
+    _ramp(model, data, act, grip, None, None, HOLD_TIME)
+
+    final = data.xpos[bid][:2].copy()
+    error = float(np.linalg.norm(final - np.asarray(target_xy, dtype=float)))
+    contacts = _object_contacts(model, data, bid)
+    return {
+        "arm": arm,
+        "object": name,
+        "target_xy": list(map(float, target_xy)),
+        "final_xy": final.tolist(),
+        "final_z": float(data.xpos[bid][2]),
+        "error": error,
+        "carry_drop": plan["carry_drop"],
+        "fouls": plan["fouls"],
+        "release_ok": plan["release_ok"],
+        "transit_clear": plan["transit_clear"],
+        "approach": plan["approach"],
+        "contacts": contacts,
+        "placed": bool(error <= PLACE_TOL and contacts["table"] > 0
+                       and contacts["arm"] == 0),
+        "stages": stages,
     }
