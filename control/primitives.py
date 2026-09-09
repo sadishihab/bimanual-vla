@@ -38,6 +38,14 @@ WIDE_OPEN = 0.10         # sentinel gap for "jaw is clear of the grasp region"
 APPROACH_HEIGHT = 0.05   # m above the grasp point for the standoff waypoint
 LIFT_HEIGHT = 0.05       # m above the grasp point for the final waypoint
 MIN_STANDOFF = 0.010     # m; below this the descent is not a descent
+# The lift goes straight up only as far as it takes to clear the table, and then
+# draws back toward the arm's own base.  Pinning it to fixed xy was costing most
+# of its height: the top-down ceiling rises steeply on the way in, so a lift that
+# tops out at 27 mm over the grasp point reaches the full 50 mm with 40 mm of
+# draw-back.  Going straight up is only needed while the prop may still be
+# touching the table, which is what the first leg is for.
+LIFT_CLEARANCE = 0.015   # m of purely vertical lift before drawing back
+LIFT_DRAWBACK = (0.0, 0.02, 0.04, 0.06)   # m of draw-back to try, nearest first
 # The transit across the table is flown over the props, not through them, and is
 # allowed a looser wrist than the grasp: it is a move, not a grasp, and demanding
 # a strict top-down tool the whole way is what leaves it nothing to reach with
@@ -45,6 +53,11 @@ MIN_STANDOFF = 0.010     # m; below this the descent is not a descent
 TRANSIT_CLEARANCE = 0.015  # m above the tallest prop for the cross-table leg
 TRANSIT_ROT_TOL = 0.50     # rad of tool tilt tolerated while in transit
 CARTESIAN_STEPS = 12     # sub-waypoints along a straight-line gripper path
+# The transit is the longest leg by far -- 185 mm against the descent's 50 -- and
+# the tool's bow off the commanded line is second order in the joint step, so at
+# twelve sub-steps it still dipped onto the prop it had come for.  More of them
+# is the whole fix; they cost only IK solves.
+TRANSIT_STEPS = 36
 MIN_FINGER_Z = 0.010     # m above the table top, so the jaws clear the surface
 # The gripper site sits on the *fixed* finger, not in the middle of the jaw
 # aperture: opening the gripper swings only the moving jaw, so the aperture spans
@@ -428,6 +441,39 @@ def path_fouls(model: mujoco.MjModel, data: mujoco.MjData, solver: IKSolver,
     return fouls
 
 
+def _plan_lift(model: mujoco.MjModel, data: mujoco.MjData, solver: IKSolver, arm: str,
+               target: np.ndarray, yaw: float, seed: np.ndarray):
+    """Where the lift can actually get to: straight up to clear, then drawn back.
+
+    The lift used to be a vertical line at the grasp point's own xy, which throws
+    away most of the height available.  Top-down reach improves sharply toward the
+    arm's base -- measured, a fork whose vertical lift clamps at 27 mm over the
+    grasp point makes the full 50 mm once the lift is allowed 40 mm of draw-back,
+    and the same holds for the mug and spoon.  Going straight up matters only
+    while the prop may still be in contact with the table; after that, drawing
+    back is free.
+
+    Returns the drawn-back top of the lift, the vertical clearance point, and how
+    far back the winner drew, preferring the least draw-back that reaches highest.
+    """
+    clear, c_info = reachable_above(solver, data, target, yaw, LIFT_CLEARANCE, seed=seed)
+    mount = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"{arm}_mount")
+    if mount < 0:
+        raise ValueError(f"scene has no body {arm}_mount")
+    inward = model.body_pos[mount][:2] - target[:2]
+    norm = float(np.linalg.norm(inward))
+    inward = inward / norm if norm > 1e-9 else np.zeros(2)
+
+    best = None
+    for back in LIFT_DRAWBACK:
+        base = target.copy()
+        base[:2] += inward * back
+        pos, info = reachable_above(solver, data, base, yaw, LIFT_HEIGHT, seed=seed)
+        if best is None or info["height"] > best[1]["height"] + 1e-4:
+            best = (pos, info, back)
+    return best[0], best[1], clear, c_info, best[2]
+
+
 def plan_grasp(model: mujoco.MjModel, data: mujoco.MjData, arm: str,
                object_name: str) -> Dict[str, object]:
     """Choose the grasp pose and both waypoint heights for ``arm`` on ``object_name``.
@@ -441,6 +487,10 @@ def plan_grasp(model: mujoco.MjModel, data: mujoco.MjData, arm: str,
     props = prop_bodies(model)
     centre, yaw0, geom = grasp_pose(model, data, object_name)
 
+    ceiling = max(float(data.geom_xpos[g][2] + model.geom_rbound[g])
+                  for b in props for g in _body_geoms(model, b))
+    parked = data.site_xpos[solver.site].copy()
+
     best = None
     for pos, candidate in grasp_candidates(centre, yaw0, geom["grasp_width"]):
         q_low, low = solver.solve(data, pos, top_down_mat(candidate))
@@ -448,42 +498,50 @@ def plan_grasp(model: mujoco.MjModel, data: mujoco.MjData, arm: str,
         # from wherever the arm is, the lift solves warm from the grasp pose.
         stand, s_info = reachable_above(solver, data, pos, candidate, APPROACH_HEIGHT,
                                         floor=MIN_STANDOFF)
-        lift, l_info = reachable_above(solver, data, pos, candidate, LIFT_HEIGHT,
-                                       seed=q_low)
-        fouls = path_fouls(model, data, solver, arm, stand, pos, candidate, props)
+        lift, l_info, clear, c_info, back = _plan_lift(model, data, solver, arm, pos,
+                                                       candidate, q_low)
+        # As high as the arm is already holding the tool, so the cross-table leg is
+        # level rather than a long descending diagonal.  A diagonal is low by the
+        # time it arrives, which is where it catches the prop it came for.
+        via = np.array([stand[0], stand[1],
+                        max(stand[2], ceiling + TRANSIT_CLEARANCE, parked[2])])
+        via, _ = reachable_toward(solver, data, via, stand, top_down_mat(candidate),
+                                  rot_tol=TRANSIT_ROT_TOL)
+        # Every leg the arm will fly before it has hold of anything, checked the
+        # same way: the transit across the table, the drop onto the standoff, and
+        # the descent.  Checking only the descent is what let a candidate through
+        # whose transit knocked the prop 10.7 mm before the jaws ever closed.
+        fouls = (path_fouls(model, data, solver, arm, parked, via, candidate, props,
+                            steps=TRANSIT_STEPS, rot_tol=TRANSIT_ROT_TOL)
+                 + path_fouls(model, data, solver, arm, via, stand, candidate, props,
+                              rot_tol=TRANSIT_ROT_TOL)
+                 + path_fouls(model, data, solver, arm, stand, pos, candidate, props))
         score = (not low["converged"], fouls, -l_info["height"],
                  low["pos_err"] + low["rot_err"])
         if best is None or score < best[0]:
-            best = (score, pos, candidate, low, stand, s_info, lift, l_info, fouls)
+            best = (score, pos, candidate, low, stand, s_info, lift, l_info, fouls,
+                    clear, c_info, back, via)
 
-    _, target, yaw, low, standoff, s_info, lifted_to, l_info, fouls = best
+    (_, target, yaw, low, standoff, s_info, lifted_to, l_info, fouls,
+     clear_to, c_info, drawback, hover) = best
     geom["chosen_yaw"] = yaw
     geom["jaw_offset"] = float(np.linalg.norm(target[:2] - centre[:2]))
     geom["grasp_ik"] = {"at_grasp": low["pos_err"], "converged": low["converged"]}
     geom["standoff"] = {k: s_info[k] for k in ("height", "clamped", "floor_ok")}
     geom["lift"] = {k: l_info[k] for k in ("height", "clamped", "floor_ok")}
+    geom["lift"]["drawback"] = float(drawback)
+    geom["lift_clearance"] = float(c_info["height"])
     # A standoff clamped below the object's top starts the descent alongside the
     # prop rather than above it.  With the jaws run back to their stop that is
     # measured clear, but it is worth knowing when it happens.
     geom["standoff_below_object"] = bool(target[2] + s_info["height"] < geom["object_top_z"])
     geom["descent_fouls"] = int(fouls)
 
-    # Route the cross-table transit over everything loose on it, then come down
-    # onto the standoff.  Flying straight at the standoff is what shoved six props
-    # off their spot before the jaws ever touched them -- 167 mm on one of them --
-    # because a standoff clamped low turns that line nearly flat.  The via point is
-    # directly over the standoff, so the last leg is vertical and shares the
-    # descent's corridor rather than cutting a new one across the table.
-    ceiling = max(float(data.geom_xpos[g][2] + model.geom_rbound[g])
-                  for b in props for g in _body_geoms(model, b))
-    hover = np.array([standoff[0], standoff[1],
-                      max(standoff[2], ceiling + TRANSIT_CLEARANCE)])
-    hover, h_info = reachable_toward(solver, data, hover, standoff,
-                                     top_down_mat(yaw), rot_tol=TRANSIT_ROT_TOL)
     geom["hover_height"] = float(hover[2] - target[2])
     geom["transit_clear"] = bool(hover[2] >= ceiling + TRANSIT_CLEARANCE)
     return {"solver": solver, "centre": centre, "target": target, "yaw": yaw,
-            "standoff": standoff, "hover": hover, "lifted_to": lifted_to, "geometry": geom,
+            "standoff": standoff, "hover": hover, "clear_to": clear_to,
+            "lifted_to": lifted_to, "geometry": geom,
             "grasp_ok": bool(low["converged"]), "lift_height": float(l_info["height"]),
             "fouls": int(fouls)}
 
@@ -555,7 +613,7 @@ def pick(model: mujoco.MjModel, data: mujoco.MjData, arm: str,
     solver = plan["solver"]
     centre, target, yaw = plan["centre"], plan["target"], plan["yaw"]
     standoff, hover = plan["standoff"], plan["hover"]
-    lifted_to, geom = plan["lifted_to"], plan["geometry"]
+    clear_to, lifted_to, geom = plan["clear_to"], plan["lifted_to"], plan["geometry"]
     stages: List[Dict[str, object]] = []
 
     def record(name: str, ik: Optional[Dict[str, object]], goal: Optional[np.ndarray]) -> None:
@@ -587,7 +645,8 @@ def pick(model: mujoco.MjModel, data: mujoco.MjData, arm: str,
     # whatever is in between; both were measured to shove props before the grasp.
     _ramp(model, data, act, grip, None, OPEN_TORQUE, OPEN_TIME)
     _move_line(model, data, act, grip, solver, data.site_xpos[solver.site].copy(),
-               hover, yaw, TRANSIT_TIME, clamp=True, rot_tol=TRANSIT_ROT_TOL,
+               hover, yaw, TRANSIT_TIME, steps=TRANSIT_STEPS, clamp=True,
+               rot_tol=TRANSIT_ROT_TOL,
                start_mat=data.site_xmat[solver.site].reshape(3, 3).copy())
     ik = _move_line(model, data, act, grip, solver, hover, standoff, yaw,
                     APPROACH_TIME, clamp=True, rot_tol=TRANSIT_ROT_TOL)
@@ -600,9 +659,11 @@ def pick(model: mujoco.MjModel, data: mujoco.MjData, arm: str,
     geom["eased"] = _squeeze(model, data, act, grip, arm, bid, CLOSE_TIME)
     record("close", None, None)
 
-    # Straight back up, so a successful grasp is not levered against the table.
-    # The squeeze is sampled at every sub-step: whether the torque command holds
-    # its force through the motion is the whole question this primitive failed on.
+    # Straight up first, so a successful grasp is not levered against the table
+    # while the prop may still be touching it, then drawn back toward the base
+    # where the top-down ceiling is higher.  The squeeze is sampled at every
+    # sub-step: whether the torque command holds its force through the motion is
+    # the question this primitive originally failed on.
     trace: List[Dict[str, object]] = []
 
     def sample(k: int) -> None:
@@ -613,8 +674,10 @@ def pick(model: mujoco.MjModel, data: mujoco.MjData, arm: str,
                       "jaw_gap": jaw_gap(model, data, arm, solver.site),
                       "grip_force": f})
 
-    ik = _move_line(model, data, act, grip, solver, target, lifted_to, yaw, LIFT_TIME,
-                    probe=sample)
+    ik = _move_line(model, data, act, grip, solver, target, clear_to, yaw,
+                    LIFT_TIME * 0.3, probe=sample)
+    ik = _move_line(model, data, act, grip, solver, clear_to, lifted_to, yaw,
+                    LIFT_TIME * 0.7, probe=sample)
     record("lift", ik, lifted_to)
 
     _ramp(model, data, act, grip, None, None, HOLD_TIME)
