@@ -19,6 +19,8 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import mujoco
 import numpy as np
 
+import itertools
+
 from control.gripper import (GRIP_TORQUE, GRIP_TRIGGER, HOLD_TORQUE, OPEN_TORQUE)
 from control.ik import (ARM_JOINTS, ROT_TOL, IKSolver, reachable_above,
                         reachable_toward, top_down_mat)
@@ -72,6 +74,8 @@ LIFT_THRESHOLD = 0.03    # m of net rise that counts as a successful lift
 # how far the tool retreats afterwards before anything else happens.
 PLACE_CLEARANCE = 0.004  # m of drop from release to rest
 RELEASE_TIME = 0.5       # s to swing the jaws back open
+PARK_TIME = 1.5          # s to send an arm back to its keyframe pose
+REGRIP_TIME = 0.05       # s per phase of a mid-carry re-squeeze
 RETREAT_HEIGHT = 0.05    # m of straight-up retreat after letting go
 PLACE_TOL = 0.020        # m; how close to its goal a placed prop has to land
 # The place legs are timed by how far they go rather than given a fixed duration.
@@ -815,6 +819,25 @@ def _carry_drop(model: mujoco.MjModel, data: mujoco.MjData, solver: IKSolver,
     return site_z - low
 
 
+def _regrip(model: mujoco.MjModel, data: mujoco.MjData, act: np.ndarray, grip: int,
+            arm: str, bid: int) -> bool:
+    """Re-seat the squeeze if the load has started to creep out of the jaws.
+
+    The holding torque is deliberately low -- enough to carry, little enough not
+    to eject -- and against that a prop under a constant wedge creeps.  Over a
+    short lift it does not matter; over a 250 mm carry across the table it does,
+    and the spoon was arriving with the jaws shut on nothing.  Watching the grip
+    and giving it a brief squeeze when it fades costs 0.15 s and is what a real
+    gripper's force loop would do continuously.
+    """
+    if min(grip_force(model, data, bid, arm).values()) >= GRIP_TRIGGER / 2.0:
+        return False
+    _ramp(model, data, act, grip, None, GRIP_TORQUE, REGRIP_TIME)
+    _ramp(model, data, act, grip, None, None, REGRIP_TIME)
+    _ramp(model, data, act, grip, None, HOLD_TORQUE, REGRIP_TIME)
+    return True
+
+
 def plan_place(model: mujoco.MjModel, data: mujoco.MjData, arm: str,
                target_xy: Sequence[float]) -> Optional[Dict[str, object]]:
     """Where to fly to let the held prop down at ``target_xy``.
@@ -914,14 +937,19 @@ def place(model: mujoco.MjModel, data: mujoco.MjData, arm: str,
             r["site_err"] = float(np.linalg.norm(data.site_xpos[solver.site] - goal))
         stages.append(r)
 
+    regrips = [0]
+
+    def hold(_k: int) -> None:
+        regrips[0] += _regrip(model, data, act, grip, arm, bid)
+
     here = data.site_xpos[solver.site].copy()
     _move_line(model, data, act, grip, solver, here, plan["via"], yaw,
                _leg_time(here, plan["via"]), steps=TRANSIT_STEPS, clamp=True,
-               rot_tol=TRANSIT_ROT_TOL,
+               rot_tol=TRANSIT_ROT_TOL, probe=hold,
                start_mat=data.site_xmat[solver.site].reshape(3, 3).copy())
     ik = _move_line(model, data, act, grip, solver, plan["via"], plan["above"], yaw,
                     _leg_time(plan["via"], plan["above"]), clamp=True,
-                    rot_tol=TRANSIT_ROT_TOL)
+                    rot_tol=TRANSIT_ROT_TOL, probe=hold)
     record("carry", ik, plan["above"])
 
     ik = _move_line(model, data, act, grip, solver, plan["above"], plan["release"],
@@ -951,8 +979,242 @@ def place(model: mujoco.MjModel, data: mujoco.MjData, arm: str,
         "release_ok": plan["release_ok"],
         "transit_clear": plan["transit_clear"],
         "approach": plan["approach"],
+        "regrips": int(regrips[0]),
         "contacts": contacts,
         "placed": bool(error <= PLACE_TOL and contacts["table"] > 0
                        and contacts["arm"] == 0),
         "stages": stages,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Handover
+# ---------------------------------------------------------------------------
+
+# Both arms have to hold the same prop at once, so the search is over where on it
+# the receiving arm grips.  Two top-down grippers separate only along their shared
+# lateral axis: along the approach they are stacked, and along the opening axis
+# the body runs -27 to +68 mm from the tool site, so there is nothing to be gained
+# there either.
+MEET_OFFSETS = 13        # receiving grasp points sampled along the prop's long axis
+MEET_CELLS = 40          # meeting positions tried, nearest the midline first
+MEET_ARMS = ("left", "right")
+
+
+def _arm_geoms(model: mujoco.MjModel, arm: str) -> set:
+    return {g for g in range(model.ngeom)
+            if (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY,
+                                  model.geom_bodyid[g]) or "").startswith(arm + "_")}
+
+
+def arm_clash(model: mujoco.MjModel, data: mujoco.MjData) -> Tuple[int, float]:
+    """Contacts between the two arms, and the deepest interpenetration in metres."""
+    left, right = _arm_geoms(model, "left"), _arm_geoms(model, "right")
+    count, deepest = 0, 0.0
+    for i in range(data.ncon):
+        c = data.contact[i]
+        pair = {c.geom1, c.geom2}
+        if (pair & left) and (pair & right):
+            count += 1
+            deepest = max(deepest, -float(c.dist))
+    return count, deepest
+
+
+def meeting_pose(model: mujoco.MjModel, data: mujoco.MjData, giver: str, taker: str,
+                 bid: int) -> Dict[str, object]:
+    """Search for a pose where both arms can hold ``bid`` at once.
+
+    The giving arm's grasp is already fixed -- it is holding the thing -- so what
+    is searched is where the prop is presented and where along it the receiving
+    arm takes hold.  A candidate has to clear three bars: both arms' IK converges
+    on its own grasp, the two arms are not in contact, and the receiving grasp is
+    on the prop's own grasp feature rather than off the end of it.
+
+    Returns the best candidate found, or the closest miss with the numbers that
+    made it a miss, because "too thin" is a measurement and not a verdict.
+    """
+    from envs.randomize import CELL, GRID_X, GRID_Y, reach_map, PROPS
+
+    name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, bid)
+    spec = {s.name: s for s in PROPS}[name]
+    rmap = reach_map(model, data)
+    both = rmap._arm_mask(giver, spec.grasp_z) & rmap._arm_mask(taker, spec.grasp_z)
+    ix, iy = np.nonzero(both)
+    if not len(ix):
+        return {"found": False, "reason": "the arms' masks do not overlap at this height",
+                "shared_cells": 0}
+    cells = np.stack([ix * CELL + GRID_X[0], iy * CELL + GRID_Y[0]], axis=1)
+    cells = cells[np.argsort(np.abs(cells[:, 1]))][:MEET_CELLS]
+
+    feature = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, f"{name}_grasp")
+    _, half = _body_bbox(model, bid, [feature] if feature >= 0 else None)
+    long_axis = 0 if half[0] >= half[1] else 1
+    reach = float(half[long_axis])
+    width = 2.0 * float(half[1 - long_axis])
+
+    solvers = {a: IKSolver(model, a) for a in (giver, taker)}
+    scratch = mujoco.MjData(model)
+    best_miss = {"found": False, "clash": None, "separation": 0.0}
+    for xy in cells:
+        centre = np.array([xy[0], xy[1], spec.grasp_z])
+        for yaw in (0.0, np.pi / 2):
+            along = np.array([np.cos(yaw + np.pi / 2), np.sin(yaw + np.pi / 2), 0.0])
+            for gi, ti in itertools.product(np.linspace(-reach, reach, MEET_OFFSETS),
+                                            repeat=2):
+                # Both grasps are free to sit anywhere along the feature, not just
+                # the receiving one, so the separation searched runs to the whole
+                # length of the feature rather than half of it.  The pick can be
+                # planned to take one end if that is what a handover needs.
+                offset = ti - gi
+                give = grasp_candidates(centre + along * gi, yaw, width)[0]
+                take = grasp_candidates(centre + along * ti, yaw, width)[0]
+                qg, ig = solvers[giver].solve(data, give[0], top_down_mat(give[1]))
+                qt, it = solvers[taker].solve(data, take[0], top_down_mat(take[1]))
+                if not (ig["converged"] and it["converged"]):
+                    continue
+                scratch.qpos[:] = data.qpos
+                scratch.qpos[solvers[giver].qadr] = qg
+                scratch.qpos[solvers[taker].qadr] = qt
+                mujoco.mj_forward(model, scratch)
+                clash, deep = arm_clash(model, scratch)
+                if clash == 0:
+                    return {"found": True, "centre": centre.tolist(), "yaw": float(yaw),
+                            "offset": float(offset), "give": give[0].tolist(),
+                            "give_yaw": float(give[1]), "take": take[0].tolist(),
+                            "take_yaw": float(take[1]), "shared_cells": int(both.sum()),
+                            "feature_length": 2.0 * reach}
+                if best_miss["clash"] is None or deep < best_miss["deepest"]:
+                    best_miss = {"found": False, "clash": clash, "deepest": deep,
+                                 "separation": abs(float(offset)),
+                                 "centre": centre.tolist()}
+                best_miss["widest"] = max(best_miss.get("widest", 0.0), abs(float(offset)))
+    best_miss.update({"shared_cells": int(both.sum()), "feature_length": 2.0 * reach,
+                      "reason": "no offset along the prop separates the two grippers"})
+    return best_miss
+
+
+def park(model: mujoco.MjModel, data: mujoco.MjData, arm: str,
+         duration: float = PARK_TIME) -> None:
+    """Send ``arm`` back to the pose the scene's keyframe parks it in.
+
+    A handover has both arms working the same square of table, one after the
+    other, and the corridor checks only ever ask about props -- nothing in them
+    looks at the other arm.  So the arm that has just let go is moved out of the
+    way rather than left standing over the spot the other one has to reach into.
+    """
+    act, grip = _arm_actuators(model, arm)
+    if not model.nkey:
+        return
+    _ramp(model, data, act, grip, model.key_ctrl[0, act].copy(), OPEN_TORQUE, duration)
+
+
+def transfer_spot(model: mujoco.MjModel, data: mujoco.MjData, giver: str, taker: str,
+                  bid: int, avoid: Sequence[Sequence[float]] = ()) -> Optional[np.ndarray]:
+    """A place on the table both arms can reach, clear of everything else.
+
+    ``avoid`` is extra (x, y, radius) circles to stay out of -- the slots already
+    filled, and where the remaining props still lie.
+    """
+    from envs.randomize import (CELL, GRID_X, GRID_Y, PROPS, PROP_SPACING,
+                                TABLE_MARGIN, reach_map, _table_bounds)
+
+    name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, bid)
+    spec = {s.name: s for s in PROPS}[name]
+    rmap = reach_map(model, data)
+    both = rmap._arm_mask(giver, spec.grasp_z) & rmap._arm_mask(taker, spec.grasp_z)
+    ix, iy = np.nonzero(both)
+    if not len(ix):
+        return None
+    xy = np.stack([ix * CELL + GRID_X[0], iy * CELL + GRID_Y[0]], axis=1)
+
+    centre, half = _table_bounds(model)
+    limit = half - spec.radius - TABLE_MARGIN
+    keep = np.all(np.abs(xy - centre) <= limit, axis=1)
+    blocks = [(a[0], a[1], a[2]) for a in avoid]
+    for other in prop_bodies(model):
+        if other == bid:
+            continue
+        oname = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, other)
+        blocks.append((data.xpos[other][0], data.xpos[other][1],
+                       {s.name: s.radius for s in PROPS}[oname]))
+    for bx, by, br in blocks:
+        keep &= np.linalg.norm(xy - np.array([bx, by]), axis=1) >= spec.radius + br + PROP_SPACING
+    if not keep.any():
+        return None
+    # Furthest inside the shared region, not merely nearest the midline.  The
+    # midline runs the whole depth of the table and its far end is the edge of
+    # what either arm can do: picking y = 0 alone put the spoon down at x = -0.17,
+    # where the receiving arm could reach the cell but not make the grasp.
+    from envs.randomize import _morph
+    depth = np.zeros_like(both, dtype=float)
+    eroded = both.copy()
+    for step in range(1, 12):
+        eroded = _morph(eroded, CELL, False)
+        if not eroded.any():
+            break
+        depth[eroded] = step * CELL
+    inside = depth[ix[keep], iy[keep]]
+    xy = xy[keep]
+    order = np.lexsort((np.abs(xy[:, 1]), -inside))
+    return xy[order[0]]
+
+
+def handover(model: mujoco.MjModel, data: mujoco.MjData, from_arm: str,
+             to_arm: str, avoid: Sequence[Sequence[float]] = ()) -> Dict[str, object]:
+    """Move whatever ``from_arm`` holds into ``to_arm``'s hands.
+
+    Not the in-air kind, and :func:`meeting_pose` is what settles that.  The two
+    arms' reach maps overlap generously -- 169 to 193 cells, a band 100 to 120 mm
+    wide across y -- so reaching a common point is not the problem.  The gripper
+    is: its collision hull spans 52.0 mm across the lateral axis (-27.8 to +24.2
+    mm of the tool site), so two top-down grippers held at the same yaw must
+    stand at least that far apart along that axis to clear each other.  Turning
+    one of them end for end buys little -- the hull is nearly symmetric there, so
+    opposed yaws still need 48.4 mm -- and the other two axes offer nothing:
+    along the approach the grippers are stacked, and along the opening axis the
+    body runs -27 to +68 mm of the tool site (at the keyframe's 0.6 rad of jaw;
+    the moving jaw swings that to +111 mm at its stop).  The longest grasp
+    feature in this scene is the mug's 36 mm, and with *both* grasps free to sit
+    at opposite ends of it the arms still interpenetrate 14.2 mm across 36
+    contacts.  The fork's 32 mm feature leaves 18.1 mm of overlap, the plate's
+    34 mm leaves 16.1.
+
+    Searching wider does not find a pose either, only a shallower floor: over
+    both arms' yaws independently -- opposed and perpendicular included, which
+    the search below does not try -- and with the two grasps stacked up the mug's
+    64 mm barrel, the least interpenetration is 14.8 mm for the fork and spoon,
+    27.5 mm for the mug and 30.0 mm for the plate.  The one clear pose that turns
+    up is not a grasp: it sits both jaw lines tangent to the mug's barrel, where
+    the chord between them is 0.0 mm and there is nothing to close on.  There is
+    no pose to implement an in-air handover against, so none is implemented.
+
+    What is left is the table: the giving arm sets the prop down where both arms
+    can reach it, and the receiving arm picks it up again.
+    """
+    bid = held_object(model, data, from_arm)
+    if bid is None:
+        return {"from": from_arm, "to": to_arm, "object": None, "handed": False,
+                "reason": "nothing held"}
+    name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, bid)
+    meeting = meeting_pose(model, data, from_arm, to_arm, bid)
+
+    spot = transfer_spot(model, data, from_arm, to_arm, bid, avoid)
+    if spot is None:
+        return {"from": from_arm, "to": to_arm, "object": name, "handed": False,
+                "reason": "no spot on the table both arms can reach is clear",
+                "meeting": meeting}
+
+    put = place(model, data, from_arm, spot)
+    if put["placed"]:
+        park(model, data, from_arm)
+    got = pick(model, data, to_arm, name) if put["placed"] else None
+    return {
+        "from": from_arm, "to": to_arm, "object": name,
+        "spot": spot.tolist(),
+        "in_air": bool(meeting["found"]),
+        "meeting": meeting,
+        "put_down": put,
+        "picked_up": got,
+        "handed": bool(put["placed"] and got is not None and got["lifted"]),
+        "reason": None if put["placed"] else "could not set it down at the transfer spot",
     }
