@@ -46,7 +46,7 @@ from typing import Dict, Optional, Sequence, Tuple
 import mujoco
 import numpy as np
 
-from control.ik import IKSolver, solve_top_down
+from control.ik import POS_TOL, ROT_TOL, IKSolver, solve_top_down
 
 # ---------------------------------------------------------------------------
 # Reachability map
@@ -58,8 +58,8 @@ GRID_Y = (-0.80, 0.80)
 CLOSE_RADIUS = 0.03            # fills holes left by finite joint sampling
 # Stay this far inside the reach boundary.  This used to be 0.05, sized for the
 # old position-only map whose edge was a fuzzy artefact of the finite joint sweep.
-# The stage-2 boundary is a real one -- IK convergence at 5 mm / 0.15 rad across
-# every yaw bin -- so a margin that large now double-counts safety and erodes the
+# The stage-2 boundary is a real one -- IK convergence at the primitive's own
+# tolerance across every yaw bin -- so a margin that large double-counts safety and erodes the
 # mug's band at z = 0.835 to nothing.  Two cells of slack covers the grid
 # quantization and the Z_TOLERANCE band.
 REACH_MARGIN = 0.02
@@ -73,12 +73,21 @@ _ARMS = ("left", "right")
 
 # Stage-2 (IK) filter.  Yaw bins span [0, pi) only: the jaws are symmetric, so a
 # grasp at yaw and at yaw + pi are the same grasp, and each bin is tried both
-# ways round.  Tolerances are looser than the solver defaults because the
-# controller ramps onto the target anyway -- a 5 mm miss and 8 degrees of tilt
-# still make a sound top-down grasp.
+# ways round.
+#
+# The tolerances are the primitive's own, not looser ones.  They used to be 5 mm
+# and 0.15 rad, on the reasoning that the controller ramps onto the target anyway.
+# That stopped being true once the primitive began clamping its waypoints: it now
+# treats a pose it cannot converge on at 1 mm as unreachable, so a cell this map
+# passes at 5 mm is one the primitive will refuse.  Two props per ten seeds
+# spawned in exactly that gap -- the map called them reachable at 4.6 mm, the
+# primitive could not hold the standoff above them at all, and the arm shoved
+# them across the table instead of picking them.  Importing the values keeps the
+# two from drifting apart again.  Cost is modest: legal cells go from 116/854/415
+# to 88/756/354 for plate/mug/cutlery.
 IK_YAW_BINS = 3
-IK_POS_TOL = 0.005             # m
-IK_ROT_TOL = 0.15              # rad
+IK_POS_TOL = POS_TOL           # m
+IK_ROT_TOL = ROT_TOL           # rad
 IK_MAX_ITERS = 60
 CACHE_DIR = pathlib.Path(__file__).resolve().parent.parent / ".cache" / "reach"
 
