@@ -9,9 +9,10 @@ guess at one:
                          the descent aimed where it used to be.  Measured as the
                          prop's horizontal displacement at the end of the
                          approach, before the jaws have touched anything.
-``far end never clears``  the grasp held, but the prop is still touching the
-                         table.  For cutlery held at the handle this is the far
-                         end: it pivots down as the handle goes up.
+``still on the table``   the grasp held, but the prop is still touching the
+                         table -- for a long piece held at one end, the far end.
+``grip lost``            nothing is holding the prop at the end and it is not on
+                         the table either: it left the jaws and is falling.
 ``lift clamped short``   the prop came up clear of the table and stayed held,
                          but by less than LIFT_THRESHOLD, because that is as far
                          as the arm reaches above that grasp point.
@@ -27,8 +28,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from control.primitives import LIFT_THRESHOLD  # noqa: E402
 
 SHOVE = 0.005            # m of pre-grasp displacement that counts as a shove
-TAGS = {"pass": "PASS", "approach shove": "shove",
-        "far end never clears": "far-end", "lift clamped short": "short"}
+TAGS = {"pass": "PASS", "approach shove": "shove", "still on the table": "on-table",
+        "grip lost": "dropped", "lift clamped short": "short"}
 
 
 def classify(report):
@@ -37,7 +38,9 @@ def classify(report):
     if report["approach_shift"] >= SHOVE:
         return "approach shove"
     if report["contacts"]["table"] > 0:
-        return "far end never clears"
+        return "still on the table"
+    if report["contacts"]["arm"] == 0:
+        return "grip lost"
     return "lift clamped short"
 
 
