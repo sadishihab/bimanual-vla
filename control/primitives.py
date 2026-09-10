@@ -69,15 +69,32 @@ MIN_FINGER_Z = 0.010     # m above the table top, so the jaws clear the surface
 # the aperture straddles the object instead.
 JAW_CLEARANCE = 0.004    # m of daylight between the fixed finger and the object edge
 LIFT_THRESHOLD = 0.03    # m of net rise that counts as a successful lift
+# A grasp feature that is round in the horizontal plane grasps the same at every
+# yaw, so for one of those the yaw is the planner's to choose, not the prop's.
+# Taking it from the body's rotation instead throws reach away for nothing: on
+# seed 0 the mug had to be received at a transfer spot where its landed yaw of
+# 0.653 rad missed the grasp by 2.3 mm and left no lift at all, while 150 of the
+# 169 cells both arms share are pickable at *some* yaw.  The pair is still tried
+# first -- it is free and it is what a non-round feature is stuck with -- and the
+# search widens only when the pair does not produce a grasp that can also lift.
+ROUND_TOL = 0.001        # m; horizontal half-extents this close count as round
+GRASP_YAW_BINS = 8       # yaws over [0, pi) tried for a round feature
 
 # Placing: how high above the table the object's own origin is let go from, and
 # how far the tool retreats afterwards before anything else happens.
 PLACE_CLEARANCE = 0.004  # m of drop from release to rest
 RELEASE_TIME = 0.5       # s to swing the jaws back open
 PARK_TIME = 1.5          # s to send an arm back to its keyframe pose
-REGRIP_TIME = 0.05       # s per phase of a mid-carry re-squeeze
 RETREAT_HEIGHT = 0.05    # m of straight-up retreat after letting go
 PLACE_TOL = 0.020        # m; how close to its goal a placed prop has to land
+# A carried prop creeps in the jaws, and the release pose is built from a
+# tool-to-prop offset measured before the carry starts.  Over the transit that
+# offset goes stale: measured on the fork's 148 mm final leg, by 8.3 mm across
+# the table and enough downward to drive the prop into the table on the descent,
+# which levered it out of the jaws and left it 17.9 mm off a 20 mm tolerance.
+# The offset is re-measured with the tool standing over the target and the load
+# still held, and the descent aimed from that.  Corrections below this are noise.
+REAIM_MIN = 0.001        # m of correction worth flying a lateral step for
 # The place legs are timed by how far they go rather than given a fixed duration.
 # A fixed one is wrong at both ends: the leg from the transit's via point down to
 # the standoff is often a millimetre or two and was being given a second and a
@@ -141,6 +158,29 @@ def _body_bbox(model: mujoco.MjModel, bid: int,
     return (lo + hi) / 2.0, (hi - lo) / 2.0
 
 
+def _lowest_z(model: mujoco.MjModel, data: mujoco.MjData, bid: int) -> float:
+    """World z of the lowest point of a body's geoms.
+
+    ``geom_rbound`` is a bounding *sphere*, so using it here understates the
+    lowest point by the geom's own aspect ratio -- measured on this scene's props,
+    by 4.7 mm on the mug and 9.2 mm on the plate.  That error is spent twice over:
+    it inflates the height a carry is told to clear by, which pushes the transit's
+    via point out of the top-down envelope, and it makes ``transit_clear`` report
+    a failure that is not there.  The oriented AABB corners are exact for the
+    boxes, cylinders and capsules the props are built from.
+    """
+    lows = []
+    for gid in _body_geoms(model, bid):
+        c, h = model.geom_aabb[gid][:3], model.geom_aabb[gid][3:]
+        rot = data.geom_xmat[gid].reshape(3, 3)
+        for sx in (-1, 1):
+            for sy in (-1, 1):
+                for sz in (-1, 1):
+                    corner = c + h * np.array([sx, sy, sz])
+                    lows.append(float((data.geom_xpos[gid] + rot @ corner)[2]))
+    return min(lows)
+
+
 def _table_top_z(model: mujoco.MjModel) -> float:
     gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "table_top")
     bid = model.geom_bodyid[gid]
@@ -165,13 +205,35 @@ def grasp_pose(model: mujoco.MjModel, data: mujoco.MjData,
     feature = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, f"{object_name}_grasp")
     centre, half = _body_bbox(model, bid, [feature] if feature >= 0 else None)
     rot = data.xmat[bid].reshape(3, 3)
-    world_centre = data.xpos[bid] + rot @ centre
 
     # Grip across whichever body axis is narrower in the horizontal plane.
     narrow = 0 if half[0] <= half[1] else 1
     axis = rot[:, narrow]
     yaw = float(np.arctan2(axis[1], axis[0]))
     width = 2.0 * float(half[narrow])
+
+    # Along the feature, grasp the prop's balance point rather than the middle of
+    # the handle.  A parallel jaw resists a moment only through friction on two
+    # small pads, and the flatware's mass is nearly all in the head: gripping the
+    # centre of the fork's 32 mm bar holds it 7.23 mm off its centre of mass (the
+    # spoon, 4.18 mm).  Measured, that moment rotates the prop in the jaws for the
+    # whole of a carry -- the fork's hang below the tool grew 43.4 mm to 59.9 mm
+    # across one transit with the grip force never dropping below 2.24 N, so no
+    # amount of watching the force notices it -- and it eventually pivots out
+    # altogether, dropping the prop 46 mm onto the table.
+    #
+    # Both balance points lie inside their own grasp feature, so this costs
+    # nothing: the clip is what keeps the jaws on the feature for a prop whose
+    # centre of mass is off the end of it, and the residual arm is reported rather
+    # than assumed away.
+    along = 1 - narrow
+    com = float(model.body_ipos[bid][along])
+    balanced = float(np.clip(com, centre[along] - half[along], centre[along] + half[along]))
+    slide = balanced - float(centre[along])
+    centre = centre.copy()
+    centre[along] = balanced
+
+    world_centre = data.xpos[bid] + rot @ centre
 
     # Vertical extent of the object in the world, from the rotated box corners.
     span = float(np.abs(rot @ np.diag(half)).sum(axis=1)[2])
@@ -182,6 +244,9 @@ def grasp_pose(model: mujoco.MjModel, data: mujoco.MjData,
     pos = np.array([world_centre[0], world_centre[1], grasp_z])
     info = {
         "grasp_width": width,
+        "yaw_free": bool(abs(half[0] - half[1]) <= ROUND_TOL),
+        "moment_arm": abs(com - balanced),
+        "grasp_slide": slide,
         "grasp_feature": mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, feature) if feature >= 0 else None,
         "object_bottom_z": bottom,
         "object_top_z": top,
@@ -582,8 +647,7 @@ def plan_grasp(model: mujoco.MjModel, data: mujoco.MjData, arm: str,
                   for b in props for g in _body_geoms(model, b))
     parked = data.site_xpos[solver.site].copy()
 
-    best = None
-    for pos, candidate in grasp_candidates(centre, yaw0, geom["grasp_width"]):
+    def consider(pos, candidate, best):
         q_low, low = solver.solve(data, pos, top_down_mat(candidate))
         # Seeded the way each motion is: the approach solves the standoff cold
         # from wherever the arm is, the lift solves warm from the grasp pose.
@@ -612,6 +676,25 @@ def plan_grasp(model: mujoco.MjModel, data: mujoco.MjData, arm: str,
         if best is None or score < best[0]:
             best = (score, pos, candidate, low, stand, s_info, lift, l_info, fouls,
                     clear, c_info, back, via)
+        return best
+
+    # The symmetric pair first; more yaws only if the pair cannot both grasp and
+    # lift, and only for a feature round enough that another yaw grasps the same.
+    groups = [grasp_candidates(centre, yaw0, geom["grasp_width"])]
+    if geom["yaw_free"]:
+        groups.append(tuple(c for k in range(1, GRASP_YAW_BINS)
+                            for c in grasp_candidates(
+                                centre, yaw0 + np.pi * k / GRASP_YAW_BINS,
+                                geom["grasp_width"])))
+    best, widened = None, False
+    for group in groups:
+        for pos, candidate in group:
+            best = consider(pos, candidate, best)
+        # A converged grasp that can also lift is all the pair has to produce.
+        if not best[0][0] and -best[0][2] > LIFT_THRESHOLD:
+            break
+        widened = len(groups) > 1
+    geom["yaw_widened"] = bool(widened)
 
     (_, target, yaw, low, standoff, s_info, lifted_to, l_info, fouls,
      clear_to, c_info, drawback, hover) = best
@@ -813,29 +896,92 @@ def _leg_time(start: np.ndarray, end: np.ndarray) -> float:
 def _carry_drop(model: mujoco.MjModel, data: mujoco.MjData, solver: IKSolver,
                 bid: int) -> float:
     """How far below the tool the held prop's lowest point hangs, in metres."""
-    site_z = float(data.site_xpos[solver.site][2])
-    low = min(float(data.geom_xpos[g][2] - model.geom_rbound[g])
-              for g in _body_geoms(model, bid))
-    return site_z - low
+    return float(data.site_xpos[solver.site][2]) - _lowest_z(model, data, bid)
 
 
-def _regrip(model: mujoco.MjModel, data: mujoco.MjData, act: np.ndarray, grip: int,
-            arm: str, bid: int) -> bool:
-    """Re-seat the squeeze if the load has started to creep out of the jaws.
+def _hold_offset(model: mujoco.MjModel, data: mujoco.MjData, solver: IKSolver,
+                 bid: int) -> np.ndarray:
+    """Where the held prop sits relative to the tool site, right now."""
+    return data.xpos[bid] - data.site_xpos[solver.site]
 
-    The holding torque is deliberately low -- enough to carry, little enough not
-    to eject -- and against that a prop under a constant wedge creeps.  Over a
-    short lift it does not matter; over a 250 mm carry across the table it does,
-    and the spoon was arriving with the jaws shut on nothing.  Watching the grip
-    and giving it a brief squeeze when it fades costs 0.15 s and is what a real
-    gripper's force loop would do continuously.
+
+def _release_pose(model: mujoco.MjModel, offset: np.ndarray, drop: float,
+                  target_xy: Sequence[float]) -> np.ndarray:
+    """Tool pose that puts a prop hanging at ``offset`` down on ``target_xy``.
+
+    The xy comes from the offset, because the goal is written against the prop's
+    body origin.  The height does not: it is set from ``drop``, the hang of the
+    prop's *lowest* point below the tool, so that ``PLACE_CLEARANCE`` is a real
+    gap under the whole prop.
+
+    Measuring the height off the origin instead is what made the descent eject
+    the load.  A prop resting on the table has its origin at its lowest point,
+    but a prop in the jaws is tilted -- the fork carried here hangs 39.8 mm below
+    the tool at its origin and 43.4 mm at its lowest tine.  Releasing at "origin
+    4 mm up" therefore left the tine 0.4 mm off the table, the descent drove it
+    in, and the reaction popped the fork out of the jaws: the gap snapped from
+    10.6 mm to 4.0 mm, the grip force went to zero, and it fell the whole 46 mm.
     """
-    if min(grip_force(model, data, bid, arm).values()) >= GRIP_TRIGGER / 2.0:
-        return False
-    _ramp(model, data, act, grip, None, GRIP_TORQUE, REGRIP_TIME)
-    _ramp(model, data, act, grip, None, None, REGRIP_TIME)
-    _ramp(model, data, act, grip, None, HOLD_TORQUE, REGRIP_TIME)
-    return True
+    return np.array([target_xy[0] - offset[0], target_xy[1] - offset[1],
+                     _table_top_z(model) + PLACE_CLEARANCE + drop])
+
+
+def _reaim(model: mujoco.MjModel, data: mujoco.MjData, solver: IKSolver, bid: int,
+           yaw: float, target_xy: Sequence[float],
+           plan: Dict[str, object]) -> Optional[Dict[str, object]]:
+    """Re-derive the release from where the prop is in the jaws *now*.
+
+    The offset the plan's release was built from was measured before the carry,
+    and the prop creeps in the jaws for the whole of it.  Returns the corrected
+    standoff, release and retreat, or ``None`` when the correction is beneath
+    noise or its poses are not reachable -- in which case the planned ones stand,
+    which is no worse than not looking.
+    """
+    release = _release_pose(model, _hold_offset(model, data, solver, bid),
+                            _carry_drop(model, data, solver, bid), target_xy)
+    shift = release - np.asarray(plan["release"], dtype=float)
+    if float(np.linalg.norm(shift)) < REAIM_MIN:
+        return None
+    _, info = solver.solve(data, release, top_down_mat(yaw))
+    if not info["converged"]:
+        return None
+    # Directly over the corrected release at the standoff the plan chose, so the
+    # whole correction is spent laterally at height and the descent stays
+    # vertical.  A slanted descent drags the load into whatever is next to it.
+    standoff = float(plan["above"][2] - np.asarray(plan["release"], dtype=float)[2])
+    above, a_info = reachable_above(solver, data, release, yaw, standoff,
+                                    floor=MIN_STANDOFF)
+    retreat, _ = reachable_above(solver, data, release, yaw, RETREAT_HEIGHT,
+                                floor=MIN_STANDOFF)
+    return {"above": above, "release": release, "retreat": retreat,
+            "report": {"above": above.tolist(), "release": release.tolist(),
+                       "retreat": retreat.tolist(),
+                       "shift": [float(v) for v in shift],
+                       "lateral": float(np.linalg.norm(shift[:2])),
+                       "sink": float(shift[2])},
+            "shift": [float(v) for v in shift],
+            "lateral": float(np.linalg.norm(shift[:2])), "sink": float(shift[2]),
+            "standoff_ok": bool(a_info["floor_ok"])}
+
+
+def _grip_faded(model: mujoco.MjModel, data: mujoco.MjData, arm: str, bid: int) -> bool:
+    """Whether the jaws have lost their grip on ``bid``.  Observation only.
+
+    This used to re-seat the squeeze when it fired, and that made things worse in
+    both of the ways it could.  A re-squeeze at the closing torque applies the
+    same 0.8 N.m sweep that :mod:`control.gripper` measures as ejecting light
+    flatware outright, and re-seating gently instead still stops the arm for
+    0.15 s each time, spending exactly the time under load that makes a wedged
+    prop creep.  Measured on the spoon's carry to the transfer spot, over the 28
+    sub-steps at which the grip had faded: re-squeezing at the closing torque put
+    it down 84.3 mm off, re-seating at the holding torque 96.0 mm off, and doing
+    nothing at all 6.0 mm off.
+
+    What the fade was really reporting was a grasp taken off the prop's centre of
+    mass, which :func:`grasp_pose` now corrects at the source.  So the fade is
+    counted and reported, and nothing is done about it mid-carry.
+    """
+    return bool(min(grip_force(model, data, bid, arm).values()) < GRIP_TRIGGER / 2.0)
 
 
 def plan_place(model: mujoco.MjModel, data: mujoco.MjData, arm: str,
@@ -855,11 +1001,10 @@ def plan_place(model: mujoco.MjModel, data: mujoco.MjData, arm: str,
     site = data.site_xpos[solver.site].copy()
     rot = data.site_xmat[solver.site].reshape(3, 3)
     yaw = float(np.arctan2(rot[1, 2], rot[0, 2]))      # site +z is the opening axis
-    offset = data.xpos[bid] - site
+    offset = _hold_offset(model, data, solver, bid)
     drop = _carry_drop(model, data, solver, bid)
 
-    release = np.array([target_xy[0] - offset[0], target_xy[1] - offset[1],
-                        _table_top_z(model) + PLACE_CLEARANCE - offset[2]])
+    release = _release_pose(model, offset, drop, target_xy)
     _, r_info = solver.solve(data, release, top_down_mat(yaw))
 
     above, a_info = reachable_above(solver, data, release, yaw, APPROACH_HEIGHT,
@@ -929,6 +1074,8 @@ def place(model: mujoco.MjModel, data: mujoco.MjData, arm: str,
                goal: Optional[np.ndarray]) -> None:
         r: Dict[str, object] = {"stage": stage, "object_z": float(data.xpos[bid][2]),
                                 "object_xy": data.xpos[bid][:2].tolist(),
+                                "site_z": float(data.site_xpos[solver.site][2]),
+                                "hang": _carry_drop(model, data, solver, bid),
                                 "contacts": _object_contacts(model, data, bid),
                                 "jaw_gap": jaw_gap(model, data, arm, solver.site),
                                 "grip_force": grip_force(model, data, bid, arm)}
@@ -937,10 +1084,10 @@ def place(model: mujoco.MjModel, data: mujoco.MjData, arm: str,
             r["site_err"] = float(np.linalg.norm(data.site_xpos[solver.site] - goal))
         stages.append(r)
 
-    regrips = [0]
+    fades = [0]
 
     def hold(_k: int) -> None:
-        regrips[0] += _regrip(model, data, act, grip, arm, bid)
+        fades[0] += _grip_faded(model, data, arm, bid)
 
     here = data.site_xpos[solver.site].copy()
     _move_line(model, data, act, grip, solver, here, plan["via"], yaw,
@@ -952,16 +1099,26 @@ def place(model: mujoco.MjModel, data: mujoco.MjData, arm: str,
                     rot_tol=TRANSIT_ROT_TOL, probe=hold)
     record("carry", ik, plan["above"])
 
-    ik = _move_line(model, data, act, grip, solver, plan["above"], plan["release"],
-                    yaw, _leg_time(plan["above"], plan["release"]))
-    record("descend", ik, plan["release"])
+    # Everything the carry accumulated is corrected here, in one lateral step at
+    # height, so that only the descent's own creep is left to land as error.
+    aim = _reaim(model, data, solver, bid, yaw, target_xy, plan)
+    above, release, retreat = plan["above"], plan["release"], plan["retreat"]
+    if aim is not None:
+        above, release, retreat = aim["above"], aim["release"], aim["retreat"]
+        ik = _move_line(model, data, act, grip, solver, plan["above"], above, yaw,
+                        _leg_time(plan["above"], above), probe=hold)
+        record("re-aim", ik, above)
+
+    ik = _move_line(model, data, act, grip, solver, above, release, yaw,
+                    _leg_time(above, release))
+    record("descend", ik, release)
 
     _ramp(model, data, act, grip, None, OPEN_TORQUE, RELEASE_TIME)
     record("release", None, None)
 
-    ik = _move_line(model, data, act, grip, solver, plan["release"], plan["retreat"],
-                    yaw, _leg_time(plan["release"], plan["retreat"]))
-    record("retreat", ik, plan["retreat"])
+    ik = _move_line(model, data, act, grip, solver, release, retreat,
+                    yaw, _leg_time(release, retreat))
+    record("retreat", ik, retreat)
     _ramp(model, data, act, grip, None, None, HOLD_TIME)
 
     final = data.xpos[bid][:2].copy()
@@ -979,7 +1136,8 @@ def place(model: mujoco.MjModel, data: mujoco.MjData, arm: str,
         "release_ok": plan["release_ok"],
         "transit_clear": plan["transit_clear"],
         "approach": plan["approach"],
-        "regrips": int(regrips[0]),
+        "reaim": None if aim is None else aim["report"],
+        "grip_fades": int(fades[0]),
         "contacts": contacts,
         "placed": bool(error <= PLACE_TOL and contacts["table"] > 0
                        and contacts["arm"] == 0),
@@ -998,6 +1156,7 @@ def place(model: mujoco.MjModel, data: mujoco.MjData, arm: str,
 # there either.
 MEET_OFFSETS = 13        # receiving grasp points sampled along the prop's long axis
 MEET_CELLS = 40          # meeting positions tried, nearest the midline first
+TRANSFER_TRIES = 24      # transfer cells tested for pickability, best-scoring first
 MEET_ARMS = ("left", "right")
 
 
@@ -1109,11 +1268,35 @@ def park(model: mujoco.MjModel, data: mujoco.MjData, arm: str,
 
 
 def transfer_spot(model: mujoco.MjModel, data: mujoco.MjData, giver: str, taker: str,
-                  bid: int, avoid: Sequence[Sequence[float]] = ()) -> Optional[np.ndarray]:
+                  bid: int, avoid: Sequence[Sequence[float]] = ()
+                  ) -> Tuple[Optional[np.ndarray], bool]:
     """A place on the table both arms can reach, clear of everything else.
 
     ``avoid`` is extra (x, y, radius) circles to stay out of -- the slots already
     filled, and where the remaining props still lie.
+
+    Returns ``(xy, pickable)``.  Reaching a cell at the grasp height is not the
+    same as being able to *pick* from it, and the difference is what a handover
+    falls down: on seed 0 the mug's spot came out at x = -0.170, which the reach
+    map covers at the mug's 782 mm grasp height, and there the receiving arm's
+    grasp IK missed by 2.3 mm and its lift clamped to 0 mm of the 30 mm that
+    counts as a lift -- so the jaws closed on the mug, held it at 2.97 N, and
+    never got it off the table.
+
+    Two things separate the map from the pick, and the test has to respect both.
+    The map is indexed by where the *prop* sits, but what has to be reachable is
+    where the *tool site* goes, and the aperture opens to one side: the site
+    stands the grasp's half-width plus its clearance away from the grasp point --
+    10 mm for the flatware, 22 mm for the mug, which is two grid cells.  And a
+    pick has to rise, so the pose is wanted at the lift height as well as at the
+    grasp.  So each candidate cell is tested at the site positions the pick will
+    actually command, at both heights, for both arms, against the same
+    converge-and-hold standard the reach map itself is built from.
+
+    ``pickable`` says whether the returned cell passed that test.  When none of
+    the candidates does, the best-scoring one is returned anyway with
+    ``pickable`` false: that is no worse than not looking, and the caller can say
+    so rather than present a doomed spot as a good one.
     """
     from envs.randomize import (CELL, GRID_X, GRID_Y, PROPS, PROP_SPACING,
                                 TABLE_MARGIN, reach_map, _table_bounds)
@@ -1124,7 +1307,7 @@ def transfer_spot(model: mujoco.MjModel, data: mujoco.MjData, giver: str, taker:
     both = rmap._arm_mask(giver, spec.grasp_z) & rmap._arm_mask(taker, spec.grasp_z)
     ix, iy = np.nonzero(both)
     if not len(ix):
-        return None
+        return None, False
     xy = np.stack([ix * CELL + GRID_X[0], iy * CELL + GRID_Y[0]], axis=1)
 
     centre, half = _table_bounds(model)
@@ -1140,7 +1323,7 @@ def transfer_spot(model: mujoco.MjModel, data: mujoco.MjData, giver: str, taker:
     for bx, by, br in blocks:
         keep &= np.linalg.norm(xy - np.array([bx, by]), axis=1) >= spec.radius + br + PROP_SPACING
     if not keep.any():
-        return None
+        return None, False
     # Furthest inside the shared region, not merely nearest the midline.  The
     # midline runs the whole depth of the table and its far end is the edge of
     # what either arm can do: picking y = 0 alone put the spoon down at x = -0.17,
@@ -1156,7 +1339,38 @@ def transfer_spot(model: mujoco.MjModel, data: mujoco.MjData, giver: str, taker:
     inside = depth[ix[keep], iy[keep]]
     xy = xy[keep]
     order = np.lexsort((np.abs(xy[:, 1]), -inside))
-    return xy[order[0]]
+
+    # Where the grasp point sits relative to the prop's own origin, taken from the
+    # prop as it is held now: it keeps that orientation through the release, and
+    # the goal the place aims at is the origin.
+    grasp_pt, grasp_yaw, ginfo = grasp_pose(model, data, name)
+    lead = grasp_pt[:2] - data.xpos[bid][:2]
+    heights = (spec.grasp_z, spec.grasp_z + LIFT_THRESHOLD)
+    solvers = {a: IKSolver(model, a) for a in (taker, giver)}
+
+    def holdable_at(arm: str, site: np.ndarray, yaw: float, z: float) -> bool:
+        q, info = solvers[arm].solve(data, np.array([site[0], site[1], z]),
+                                    top_down_mat(yaw))
+        return bool(info["converged"] and solvers[arm].holdable(q))
+
+    yaws = [grasp_yaw]
+    if ginfo["yaw_free"]:
+        yaws += [grasp_yaw + np.pi * k / GRASP_YAW_BINS
+                 for k in range(1, GRASP_YAW_BINS)]
+
+    def pickable_at(cell: np.ndarray) -> bool:
+        at = np.array([cell[0] + lead[0], cell[1] + lead[1], spec.grasp_z])
+        for y0 in yaws:
+            for site, yaw in grasp_candidates(at, y0, ginfo["grasp_width"]):
+                if all(holdable_at(arm, site, yaw, z)
+                       for arm in (taker, giver) for z in heights):
+                    return True
+        return False
+
+    for k in order[:TRANSFER_TRIES]:
+        if pickable_at(xy[k]):
+            return xy[k], True
+    return xy[order[0]], False
 
 
 def handover(model: mujoco.MjModel, data: mujoco.MjData, from_arm: str,
@@ -1198,7 +1412,7 @@ def handover(model: mujoco.MjModel, data: mujoco.MjData, from_arm: str,
     name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, bid)
     meeting = meeting_pose(model, data, from_arm, to_arm, bid)
 
-    spot = transfer_spot(model, data, from_arm, to_arm, bid, avoid)
+    spot, pickable = transfer_spot(model, data, from_arm, to_arm, bid, avoid)
     if spot is None:
         return {"from": from_arm, "to": to_arm, "object": name, "handed": False,
                 "reason": "no spot on the table both arms can reach is clear",
@@ -1211,6 +1425,7 @@ def handover(model: mujoco.MjModel, data: mujoco.MjData, from_arm: str,
     return {
         "from": from_arm, "to": to_arm, "object": name,
         "spot": spot.tolist(),
+        "spot_pickable": bool(pickable),
         "in_air": bool(meeting["found"]),
         "meeting": meeting,
         "put_down": put,

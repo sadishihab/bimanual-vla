@@ -88,7 +88,7 @@ def main() -> None:
     put = hand["put_down"]
     print(f"     put down {hand['from']:5s}  err {put['error'] * 1000:6.1f} mm"
           f"  {'placed' if put['placed'] else 'FAILED'}"
-          f"  fouls {put['fouls']:2d}  regrips {put.get('regrips', 0)}")
+          f"  fouls {put['fouls']:2d}  grip fades {put.get('grip_fades', 0)}")
     up = hand["picked_up"]
     if up is None:
         print(f"     pick up  {hand['to']:5s}  not attempted ({hand['reason']})")
@@ -102,7 +102,7 @@ def main() -> None:
     final = place(model, data, to_arm, goal[name])
     print(f"\n  3. place  {to_arm:5s}  err {final['error'] * 1000:6.1f} mm"
           f"  {'placed' if final['placed'] else 'FAILED'}"
-          f"  fouls {final['fouls']:2d}  regrips {final.get('regrips', 0)}"
+          f"  fouls {final['fouls']:2d}  grip fades {final.get('grip_fades', 0)}"
           f"{'' if final['placed'] else '  (' + str(final.get('reason', 'off target')) + ')'}")
 
     at = data.xpos[bid][:2]
