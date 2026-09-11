@@ -94,7 +94,24 @@ def main() -> None:
 
         # One arm does both halves, so it has to be an arm that can reach the goal
         # as well as the prop.
+        #
+        # This is asked again here rather than taken from the crossings computed
+        # before anything moved, and it can come back empty even for a prop those
+        # crossings called movable.  Reachability is answered against the prop's
+        # *current* orientation, because the tool site's offset from the prop
+        # rotates with it, and an earlier step can nudge a prop: measured on seed
+        # 48, turning the fork 90 degrees takes its slot from both arms to the
+        # right arm only.  The flatware has a single grasp yaw and so only two
+        # site offsets, which is what makes it fragile that way; the round plate
+        # and mug have fourteen or more and keep their answer.  Left unhandled
+        # this reached best_arm with nothing to choose from and crashed the run.
         reaching = arms_reaching(model, data, name, goal[name])
+        if not reaching:
+            steps.append({"object": name, "arm": None, "pick": None, "place": None,
+                          "skipped": "no arm reaches its slot any more"})
+            print(f"  {name:6s} --     skipped, no arm reaches its slot any more"
+                  f" (it was turned by an earlier step)")
+            continue
         arm = best_arm(model, data, name, arms=reaching)[0]
         got = pick(model, data, arm, name)
         put = place(model, data, arm, goal[name])
