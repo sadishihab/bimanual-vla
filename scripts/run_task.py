@@ -104,6 +104,7 @@ def main() -> None:
 
     print("\n  final layout")
     ok = True
+    layout = {}
     for name in PLACE_ORDER:
         bid = _bid(model, name)
         at = data.xpos[bid][:2]
@@ -116,6 +117,9 @@ def main() -> None:
                        if held_object(model, data, a) == bid), None)
         settled = err <= args.tolerance and holder is None
         ok &= settled
+        layout[name] = {"at": at.tolist(), "error": err, "moved": moved,
+                        "held_by": holder, "settled": bool(settled),
+                        "z_above_table": float(data.xpos[bid][2] - _table_top_z(model))}
         print(f"  {name:6s} at {_fmt(at)}  goal {_fmt(goal[name])}"
               f"  err {err * 1000:6.1f} mm  moved {moved * 1000:6.1f} mm"
               f"  {'ok' if settled else 'OUT OF TOLERANCE'}"
@@ -136,8 +140,11 @@ def main() -> None:
 
     if args.dump:
         print(json.dumps({"seed": args.seed,
+                          "tolerance": args.tolerance,
                           "goal": {k: v.tolist() for k, v in goal.items()},
-                          "steps": steps, "matched": ok},
+                          "blocked": {k: [list(v[0]), list(v[1])]
+                                      for k, v in blocked.items()},
+                          "steps": steps, "layout": layout, "matched": ok},
                          indent=2, sort_keys=True, default=float))
     raise SystemExit(0 if ok else 1)
 

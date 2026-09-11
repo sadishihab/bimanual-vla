@@ -187,6 +187,84 @@ def _table_top_z(model: mujoco.MjModel) -> float:
     return float(model.body_pos[bid][2] + model.geom_pos[gid][2] + model.geom_size[gid][2])
 
 
+def _grasp_feature(model: mujoco.MjModel, bid: int) -> Dict[str, object]:
+    """The grasp feature's box in the body frame, with the grasp slid to balance.
+
+    Everything here is body-frame model geometry, so it does not depend on where
+    the prop currently is.  :func:`grasp_pose` rotates it into the world to make a
+    grasp; :func:`site_offset` needs only its magnitudes.  Shared so the two
+    cannot drift apart.
+
+    Along the feature, the grasp goes to the prop's balance point rather than the
+    middle of the handle.  A parallel jaw resists a moment only through friction on
+    two small pads, and the flatware's mass is nearly all in the head: gripping the
+    centre of the fork's 32 mm bar holds it 7.23 mm off its centre of mass (the
+    spoon, 4.18 mm).  Measured, that moment rotates the prop in the jaws for the
+    whole of a carry -- the fork's hang below the tool grew 43.4 mm to 59.9 mm
+    across one transit with the grip force never dropping below 2.24 N, so no
+    amount of watching the force notices it -- and it eventually pivots out
+    altogether, dropping the prop 46 mm onto the table.
+
+    Both balance points lie inside their own grasp feature, so this costs nothing:
+    the clip is what keeps the jaws on the feature for a prop whose centre of mass
+    is off the end of it, and the residual arm is reported rather than assumed away.
+    """
+    # A prop may declare its grasp feature as a geom named <prop>_grasp.  Without
+    # that, the merged bounding box of a fork is dominated by its head and the
+    # grasp lands on the wrong part at the wrong width.
+    name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, bid)
+    feature = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, f"{name}_grasp")
+    centre, half = _body_bbox(model, bid, [feature] if feature >= 0 else None)
+
+    # Grip across whichever body axis is narrower in the horizontal plane.
+    narrow = 0 if half[0] <= half[1] else 1
+    along = 1 - narrow
+    com = float(model.body_ipos[bid][along])
+    balanced = float(np.clip(com, centre[along] - half[along], centre[along] + half[along]))
+    slide = balanced - float(centre[along])
+    centre = centre.copy()
+    centre[along] = balanced
+    return {"centre": centre, "half": half, "narrow": narrow, "along": along,
+            "width": 2.0 * float(half[narrow]), "feature": feature,
+            "moment_arm": abs(com - balanced), "slide": slide,
+            "yaw_free": bool(abs(half[0] - half[1]) <= ROUND_TOL)}
+
+
+def site_offset(model: mujoco.MjModel, object_name: str) -> Dict[str, float]:
+    """How far the tool site stands from a prop's own origin, in the plane.
+
+    The reach map is indexed by where the *prop* goes, but what has to be
+    reachable is where the *tool site* goes, and two body-frame offsets separate
+    them.  The grasp point is the balance point of the grasp feature, which need
+    not sit over the body origin -- the fork's is 4.8 mm off it.  And the aperture
+    opens to one side of the site, so the site stands the grasp's half-width plus
+    its clearance back from the grasp point: 22 mm for the mug, which is two cells
+    of the reach map's 10 mm grid.
+
+    Both offsets rotate with the prop, and their sum is a fixed body-frame vector,
+    so the site sits on a circle of this radius about the prop's origin.  A goal
+    slot cannot know what yaw the prop will arrive at, so the radius is what a
+    reach test has to respect -- measured, ignoring it is what let seed 0's goal
+    layout hand the mug a slot whose release pose its receiving arm misses by
+    7.5 mm, and what let a transfer spot be chosen where the receiving grasp
+    missed by 2.3 mm with no lift left at all.
+
+    Returns the two magnitudes and the radius, in metres.
+    """
+    bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, object_name)
+    if bid < 0:
+        raise ValueError(f"scene has no body {object_name}")
+    f = _grasp_feature(model, bid)
+    jaw = f["width"] / 2.0 + JAW_CLEARANCE
+    lead = np.asarray(f["centre"][:2], dtype=float)
+    # The jaw offset runs along the narrow (opening) axis, either way round; the
+    # lead is mostly along the other one.  Take the worse of the two.
+    step = np.zeros(2)
+    step[f["narrow"]] = jaw
+    radius = max(float(np.linalg.norm(lead + s * step)) for s in (1.0, -1.0))
+    return {"lead": float(np.linalg.norm(lead)), "jaw": float(jaw), "radius": radius}
+
+
 def grasp_pose(model: mujoco.MjModel, data: mujoco.MjData,
                object_name: str) -> Tuple[np.ndarray, float, Dict[str, object]]:
     """Where and how to grasp ``object_name`` from above.
@@ -199,39 +277,11 @@ def grasp_pose(model: mujoco.MjModel, data: mujoco.MjData,
     if bid < 0:
         raise ValueError(f"scene has no body {object_name}")
 
-    # A prop may declare its grasp feature as a geom named <prop>_grasp.  Without
-    # that, the merged bounding box of a fork is dominated by its head and the
-    # grasp lands on the wrong part at the wrong width.
-    feature = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, f"{object_name}_grasp")
-    centre, half = _body_bbox(model, bid, [feature] if feature >= 0 else None)
+    f = _grasp_feature(model, bid)
+    centre, half, width, feature = f["centre"], f["half"], f["width"], f["feature"]
     rot = data.xmat[bid].reshape(3, 3)
-
-    # Grip across whichever body axis is narrower in the horizontal plane.
-    narrow = 0 if half[0] <= half[1] else 1
-    axis = rot[:, narrow]
+    axis = rot[:, f["narrow"]]
     yaw = float(np.arctan2(axis[1], axis[0]))
-    width = 2.0 * float(half[narrow])
-
-    # Along the feature, grasp the prop's balance point rather than the middle of
-    # the handle.  A parallel jaw resists a moment only through friction on two
-    # small pads, and the flatware's mass is nearly all in the head: gripping the
-    # centre of the fork's 32 mm bar holds it 7.23 mm off its centre of mass (the
-    # spoon, 4.18 mm).  Measured, that moment rotates the prop in the jaws for the
-    # whole of a carry -- the fork's hang below the tool grew 43.4 mm to 59.9 mm
-    # across one transit with the grip force never dropping below 2.24 N, so no
-    # amount of watching the force notices it -- and it eventually pivots out
-    # altogether, dropping the prop 46 mm onto the table.
-    #
-    # Both balance points lie inside their own grasp feature, so this costs
-    # nothing: the clip is what keeps the jaws on the feature for a prop whose
-    # centre of mass is off the end of it, and the residual arm is reported rather
-    # than assumed away.
-    along = 1 - narrow
-    com = float(model.body_ipos[bid][along])
-    balanced = float(np.clip(com, centre[along] - half[along], centre[along] + half[along]))
-    slide = balanced - float(centre[along])
-    centre = centre.copy()
-    centre[along] = balanced
 
     world_centre = data.xpos[bid] + rot @ centre
 
@@ -244,9 +294,9 @@ def grasp_pose(model: mujoco.MjModel, data: mujoco.MjData,
     pos = np.array([world_centre[0], world_centre[1], grasp_z])
     info = {
         "grasp_width": width,
-        "yaw_free": bool(abs(half[0] - half[1]) <= ROUND_TOL),
-        "moment_arm": abs(com - balanced),
-        "grasp_slide": slide,
+        "yaw_free": f["yaw_free"],
+        "moment_arm": f["moment_arm"],
+        "grasp_slide": f["slide"],
         "grasp_feature": mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, feature) if feature >= 0 else None,
         "object_bottom_z": bottom,
         "object_top_z": top,
