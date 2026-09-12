@@ -1,8 +1,8 @@
 # Training ACT on the bimanual demonstrations, on Kaggle
 
-`train_act_kaggle.ipynb` trains an [ACT](https://tonyzhaozh.github.io/aloha/)
-policy on the scripted-expert demonstrations recorded by
-`scripts/record_demos.py`. It is written for **one 16 GB T4**, and for Kaggle's
+`train_act_kaggle.ipynb` trains a **language-conditioned**
+[ACT](https://tonyzhaozh.github.io/aloha/) policy on the scripted-expert
+demonstrations recorded by `scripts/record_demos.py`. It is written for **one 16 GB T4**, and for Kaggle's
 session limits in particular: it checkpoints to `/kaggle/working` and resumes
 from the newest checkpoint, so a restart costs you one checkpoint interval
 rather than the whole run.
@@ -57,7 +57,8 @@ want `/kaggle/working` to survive between sessions without re-downloading.
 
 | stage | time |
 |---|---|
-| `pip install lerobot==0.4.4` | 4–10 min (it pulls its own torch build, ~2.5 GB) |
+| `pip install lerobot==0.4.4` + transformers pin | 4–10 min (it pulls its own torch build, ~2.5 GB) |
+| downloading MiniLM-L6 | under 1 min (~90 MB), once |
 | extracting the archive | under 1 min |
 | loading + the verification cells | 1–2 min |
 | training | see below |
@@ -88,6 +89,42 @@ not the GPU: the frames are AV1, and Kaggle gives only 4 vCPUs. Raising
   do not switch to plain fp16 without it.
 - `KEEP_CKPTS = 2` — each checkpoint is ~0.58 GiB and `/kaggle/working` is capped
   at 20 GB.
+
+## Language conditioning
+
+ACT in lerobot 0.4.4 has no language path: its inputs are the images and the robot
+state, and the dataset's task strings are never read. Trained that way it placed 3
+of 40 props in closed loop and only ever went for the plate, because nothing could
+tell it which prop to move.
+
+The notebook trains the conditioned variant. The task string is embedded by a frozen
+MiniLM-L6 (22.7 M parameters, 384-d, mean-pooled and L2-normalized) and handed to ACT
+as one extra encoder token through `observation.environment_state` — the slot ACT
+already has for a 1-D observation vector, which gets its own `nn.Linear` into
+`dim_model` and its own learned positional embedding. **lerobot is not patched**, and
+the result is still an ordinary ACT checkpoint that `ACTPolicy.from_pretrained` loads.
+
+- Only the 384→512 projection is learned: **197,120 parameters**. The text encoder
+  stays frozen and never enters the checkpoint.
+- The dataset has 7 task strings, so they are embedded once at setup and looked up.
+  Training speed is unchanged, and **the dataset did not have to be repacked** — the
+  embedding is injected into the batch, not stored as a column.
+- The token conditions the encoder feeding the decoder, **not the VAE posterior**;
+  ACT's VAE encoder sees the cls token, robot state and actions only.
+- Each checkpoint gets a `task_embeddings.json` beside it, so inference needs the
+  table but not the text model — and a different `transformers` build cannot shift
+  the embeddings under a trained projection.
+- Set `CONDITION_ON_LANGUAGE = False` to train the unconditioned baseline instead.
+
+`control/language.py` is the canonical copy of this code, used by the evaluation and
+conversion scripts; the notebook inlines it to stay self-contained on Kaggle. Keep
+the two in step.
+
+**`transformers` is pinned to `>=4.57.1,<5`**, which is what lerobot 0.4.4 declares.
+This is not cosmetic: transformers 5.x breaks `import lerobot.policies` outright with
+a dataclass error in its GR00T module, so an unpinned install on a newer base image
+leaves you with a broken lerobot. The install cell asserts the version and imports
+`lerobot.policies.factory` to fail loudly if the pin slipped.
 
 ## The mixed-unit action, and normalization
 

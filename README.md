@@ -369,7 +369,10 @@ evaluation:
 
 - **The policy is not task-conditioned.** ACT's inputs here are the two images and
   the twelve joint positions. The dataset's seven task strings were recorded but ACT
-  never consumes them, so the policy cannot be told which prop to move.
+  never consumes them, so the policy cannot be told which prop to move. lerobot
+  0.4.4's ACT has no language path at all — the only matches for "language" in its
+  model and config are the Apache licence header. `control/language.py` adds one, as
+  an extra encoder token; it is wired and tested but not yet trained.
 - **Every episode starts from the parked pose, and the expert always does the plate
   first** (`PLACE_ORDER` begins with it). The plate is also the most common episode,
   47 of 134. So from the opening observation, the demonstrated action is nearly
@@ -639,5 +642,7 @@ convert, quantize and benchmark. See `notebooks/README.md` for training and
 - **The demonstrations are successes only.** A policy trained on them has never seen a
   recovery, and the closed-loop evaluation shows it: nothing recovers once the state
   leaves the demonstrated distribution.
-- **The policy is not task-conditioned**, so it cannot be directed at a prop. Adding
-  the task string as an input is the first thing to change before training again.
+- **The evaluated policy is not task-conditioned**, which is why it only ever goes
+  for the plate. `control/language.py` adds conditioning and the Kaggle notebook
+  trains the conditioned variant, but **that variant has not been trained yet**, so
+  whether it fixes the behaviour is untested.
