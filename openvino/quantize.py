@@ -32,7 +32,13 @@ import numpy as np
 import openvino as ov
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from act_io import DEFAULT_CAMERAS, GRIPPER_CHANNELS, STATE_KEY  # noqa: E402
+from act_io import (DEFAULT_CAMERAS, ENV_KEY, GRIPPER_CHANNELS,  # noqa: E402
+                    STATE_KEY, real_frames, task_embedder)
+
+
+# Calibration frames come from act_io.real_frames, shared with convert.py's parity
+# check: both need the same raw observations, and a conditioned graph needs the task
+# embedding alongside them.
 
 
 def action_head_nodes(model) -> list:
@@ -64,27 +70,6 @@ def action_head_nodes(model) -> list:
     return []
 
 
-def dataset_frames(root: pathlib.Path, repo_id: str, cameras, needed: int, batch: int):
-    """Raw observations from the recorded dataset, as the IR takes them."""
-    from lerobot.datasets.lerobot_dataset import LeRobotDataset
-
-    ds = LeRobotDataset(repo_id, root=root)
-    missing = [c for c in cameras if c not in ds.meta.camera_keys]
-    if missing:
-        raise SystemExit(f"dataset has no camera(s) {missing}; it has {ds.meta.camera_keys}")
-    # Spread the picks across the whole dataset rather than taking the first N
-    # frames, which would all come from one episode of one seed.
-    idx = np.linspace(0, len(ds) - 1, num=min(needed, len(ds)), dtype=int)
-    out = []
-    for i in idx:
-        s = ds[int(i)]
-        item = {STATE_KEY: s[STATE_KEY].numpy()[None].astype(np.float32).repeat(batch, 0)}
-        for cam in cameras:
-            item[cam] = s[cam].numpy()[None].astype(np.float32).repeat(batch, 0)
-        out.append(item)
-    return out, len(ds)
-
-
 def synthetic_frames(specs, needed: int):
     """Fallback when no dataset is present: uniform noise in the right ranges."""
     rng = np.random.default_rng(0)
@@ -92,8 +77,13 @@ def synthetic_frames(specs, needed: int):
     for _ in range(needed):
         item = {}
         for name, shape in specs:
-            item[name] = (rng.random(shape, dtype=np.float32) * 2 - 1
-                          if name == STATE_KEY else rng.random(shape, dtype=np.float32))
+            if name == STATE_KEY:
+                item[name] = rng.random(shape, dtype=np.float32) * 2 - 1
+            elif name == ENV_KEY:
+                v = rng.standard_normal(shape, dtype=np.float32)
+                item[name] = v / np.linalg.norm(v, axis=-1, keepdims=True)
+            else:
+                item[name] = rng.random(shape, dtype=np.float32)
         out.append(item)
     return out
 
@@ -107,6 +97,9 @@ def main() -> None:
     parser.add_argument("--dataset", type=pathlib.Path,
                         default=here.parent / ".cache" / "lerobot" / "bimanual_table_setting")
     parser.add_argument("--repo-id", default="local/bimanual_table_setting")
+    parser.add_argument("--checkpoint", type=pathlib.Path, default=None,
+                        help="only for its task_embeddings.json, when the IR is "
+                             "language-conditioned")
     parser.add_argument("--subset-size", type=int, default=300,
                         help="calibration frames; NNCF's default is 300")
     parser.add_argument("--eval-frames", type=int, default=16,
@@ -140,7 +133,12 @@ def main() -> None:
         specs.append((next(iter(names)) if names else port.get_node().get_friendly_name(),
                       tuple(shape.to_shape())))
     batch = specs[0][1][0]
-    cameras = [n for n, _ in specs if n != STATE_KEY] or list(DEFAULT_CAMERAS)
+    names = [n for n, _ in specs]
+    env_key = ENV_KEY if ENV_KEY in names else None
+    # The task embedding is an input but it is not a camera; treating it as one
+    # would hand the backbone a 384-vector and the encoder nothing.
+    cameras = [n for n in names if n not in (STATE_KEY, ENV_KEY)] or list(DEFAULT_CAMERAS)
+    env_dim = dict(specs)[env_key][1] if env_key else None
 
     print("INT8 post-training quantization")
     print(f"  source IR      : {args.ir}")
@@ -149,9 +147,14 @@ def main() -> None:
 
     total = args.subset_size + args.eval_frames
     have_dataset = (args.dataset / "meta" / "info.json").exists()
+    embed = None
+    if env_key is not None:
+        embed, label = task_embedder(args.checkpoint, env_dim)
+        print(f"  language       : conditioned, {env_dim}-d; embeddings from {label}")
     if have_dataset:
-        frames, n_total = dataset_frames(args.dataset, args.repo_id, cameras, total, batch)
-        print(f"  calibration    : {len(frames)} frames sampled across {n_total} "
+        frames = real_frames(args.dataset, args.repo_id, cameras, total, batch,
+                             env_key=env_key, embed=embed)
+        print(f"  calibration    : {len(frames)} frames sampled across the dataset "
               f"in {args.dataset.name}")
     else:
         frames = synthetic_frames(specs, total)

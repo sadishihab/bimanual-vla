@@ -468,6 +468,10 @@ builds `Linear(384, 512)`, and the projection receives gradient.
   **0.869**), so prop identity dominates the embedding.
 - The result is an ordinary ACT checkpoint that `ACTPolicy.from_pretrained` loads,
   which a forked `ACT.forward` would have broken — and with it the OpenVINO pipeline.
+- The conversion path takes it: a conditioned IR has a **fourth input**,
+  `observation.environment_state (1, 384)`, appended after the cameras so the
+  unconditioned graph is unchanged. Verified with random weights; `convert.py` detects
+  the token from a conditioned checkpoint's own config.
 
 Two caveats stated up front. The token conditions the encoder feeding the decoder,
 **not the VAE posterior** (which sees cls, robot state and actions only). And
@@ -644,6 +648,7 @@ quantize and benchmark. See `notebooks/README.md` for training and
 - **FP16 is unusable on this model** and the cause inside OpenVINO's compression pass
   was not identified.
 - **GPU and NPU are unmeasured**, for the reason stated above.
-- **A conditioned checkpoint will not convert yet**: the IR gains a third input, so
-  `openvino/act_io.py` needs it wired through first. The unconditioned checkpoint is
-  unaffected.
+- **The conditioned policy is unmeasured end to end.** Its IR converts and quantizes
+  (verified with random weights), but no trained conditioned checkpoint exists yet, so
+  its accuracy through FP16/INT8 is unknown — and FP16's failure on the unconditioned
+  model is reason to check rather than assume.

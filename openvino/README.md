@@ -30,6 +30,44 @@ random weights give meaningless behaviour and exactly as meaningful latency.
 All numbers below are from the real checkpoint: **`checkpoints/step_0044000`,
 44,000 steps, final loss 0.09 (L1 0.09)**.
 
+## Language-conditioned checkpoints
+
+A conditioned policy (see `control/language.py`) takes the task string as a 384-d
+sentence embedding through ACT's spare 1-D observation slot, so its IR has **four
+inputs** instead of three:
+
+```
+observation.state             (1, 12)
+observation.images.overhead   (1, 3, 256, 256)
+observation.images.front      (1, 3, 256, 256)
+observation.environment_state (1, 384)        <- the task embedding
+```
+
+The embedding goes **last**, so a conditioned graph is an unconditioned one with an
+input appended: anything reading the first inputs positionally keeps working, and the
+unconditioned graph is unchanged.
+
+Nothing needs a flag for a real checkpoint — the conditioned config declares the
+token and `convert.py` detects it. `--language` exists only to build the conditioned
+architecture with random weights before a checkpoint arrives:
+
+```sh
+python openvino/convert.py --checkpoint <conditioned ckpt>   # detected
+python openvino/convert.py --language                        # random weights
+```
+
+The token is normalized `IDENTITY`, which is what lets it through without the dataset
+ever carrying statistics for it: the embeddings are already L2-normalized, and
+standardizing them would distort the directions that carry the meaning.
+
+For the parity check and for calibration, the embedding is taken **per frame from
+that frame's own task string** — ranges measured against one task would not cover the
+others. The source is, in order: the `task_embeddings.json` a conditioned checkpoint
+is saved with (the one that matters, since it pins the exact vectors the projection
+was trained against), the live text encoder if `transformers` is installed, or a
+deterministic stand-in that says so. `quantize.py` takes `--checkpoint` purely to
+find that table.
+
 ## Two decisions worth knowing
 
 **The IR is self-contained.** Normalization of the inputs and unnormalization of

@@ -30,9 +30,9 @@ import openvino as ov
 import torch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from act_io import (add_model_args, describe_normalization,  # noqa: E402
+from act_io import (ENV_KEY, add_model_args, describe_normalization,  # noqa: E402
                     divergence_report, example_inputs, input_specs,
-                    load_for_export, real_frames)
+                    load_for_export, real_frames, task_embedder)
 
 
 def convert_via_torch(module, cfg, cameras, batch):
@@ -71,6 +71,11 @@ def main() -> None:
     print(f"  weights        : {args.checkpoint or 'randomly initialized (no checkpoint)'}")
     print(f"  statistics     : {source}")
     print(f"  cameras        : {', '.join(cameras)}")
+    if cfg.env_state_feature:
+        print(f"  language       : conditioned, {cfg.env_state_feature.shape[0]}-d task"
+              f" embedding as an extra encoder token")
+    else:
+        print(f"  language       : none (unconditioned policy)")
     print(f"  chunk / batch  : {cfg.chunk_size} / {args.batch}")
     describe_normalization(module, cfg)
     for name, shape in input_specs(cfg, cameras, args.batch):
@@ -132,9 +137,16 @@ def main() -> None:
     # 44k-step checkpoint, the fp16 IR came out at 1.2e-03 against synthetic input
     # and 1.9e+00 against real frames -- three orders of magnitude apart.
     root = args.dataset if args.dataset and (args.dataset / "meta" / "info.json").exists() else None
+    env_key = ENV_KEY if cfg.env_state_feature else None
+    embed = label = None
+    if env_key is not None:
+        embed, label = task_embedder(args.checkpoint, cfg.env_state_feature.shape[0])
     if root is not None:
-        frames = real_frames(root, args.repo_id, cameras, args.check_frames, args.batch)
+        frames = real_frames(root, args.repo_id, cameras, args.check_frames, args.batch,
+                             env_key=env_key, embed=embed)
         print(f"\nparity against torch, on {len(frames)} real frames from {root.name}:")
+        if label:
+            print(f"  task embeddings from: {label}")
     else:
         names = [n for n, _ in input_specs(cfg, cameras, args.batch)]
         frames = [dict(zip(names, [e.numpy() for e in example]))]
