@@ -125,10 +125,21 @@ def build_policy(checkpoint: Optional[pathlib.Path], meta, *, chunk: int,
 
 
 def _stats_from_checkpoint(cfg: ACTConfig, checkpoint: pathlib.Path):
-    """Statistics the checkpoint's own preprocessor was saved with, or ``None``."""
+    """Statistics the checkpoint's own preprocessor was saved with, or ``None``.
+
+    The saved pipeline carries the device it was trained on -- a checkpoint off a
+    GPU box pins ``device_processor`` to cuda -- and instantiating that here would
+    fail on a machine with no CUDA, which is exactly the machine you convert for
+    deployment on.  The device is overridden to the one this config is running at;
+    it affects only where the statistics tensors land, not their values.
+    """
     if not any(checkpoint.glob("*normalizer_processor*")):
         return None
-    pre, _ = make_pre_post_processors(policy_cfg=cfg, pretrained_path=str(checkpoint))
+    pre, _ = make_pre_post_processors(
+        policy_cfg=cfg,
+        pretrained_path=str(checkpoint),
+        preprocessor_overrides={"device_processor": {"device": str(cfg.device or "cpu")}},
+    )
     for step in pre.steps:
         if isinstance(step, NormalizerProcessorStep):
             return step.stats
@@ -237,6 +248,59 @@ def example_inputs(cfg: ACTConfig, cameras: Sequence[str], batch: int
         else:
             out.append(torch.rand(shape, generator=g))
     return tuple(out)
+
+
+def real_frames(root: pathlib.Path, repo_id: str, cameras: Sequence[str],
+                needed: int, batch: int, state_key: str = STATE_KEY) -> List[dict]:
+    """Raw observations from the recorded dataset, shaped as the IR takes them.
+
+    Picks are spread with ``linspace`` across the whole dataset rather than taken
+    from the front, which would draw every frame from one episode of one seed.
+
+    Both the parity check and the quantization calibration need these, and both
+    need them *raw*: the graph normalizes internally, so anything pre-normalized
+    would be wrong twice over.
+    """
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    ds = LeRobotDataset(repo_id, root=root)
+    missing = [c for c in cameras if c not in ds.meta.camera_keys]
+    if missing:
+        raise SystemExit(f"dataset has no camera(s) {missing}; it has {ds.meta.camera_keys}")
+    idx = np.linspace(0, len(ds) - 1, num=min(needed, len(ds)), dtype=int)
+    out = []
+    for i in idx:
+        s = ds[int(i)]
+        item = {state_key: s[state_key].numpy()[None].astype(np.float32).repeat(batch, 0)}
+        for cam in cameras:
+            item[cam] = s[cam].numpy()[None].astype(np.float32).repeat(batch, 0)
+        out.append(item)
+    return out
+
+
+def divergence_report(a: np.ndarray, b: np.ndarray, label: str) -> float:
+    """Per-unit-group divergence between two action chunks.  Returns the max abs.
+
+    Split by unit because a single number hides the thing that matters: the arm
+    channels are radians over a wide range and tolerate absolute error far better
+    than the gripper's torque, whose whole span is under 2 N.m and whose *sign*
+    decides whether the hand opens or closes.
+    """
+    err = np.abs(a - b)
+    dim = a.shape[-1]
+    grip = [c for c in GRIPPER_CHANNELS if c < dim]
+    arm = [c for c in range(dim) if c not in grip]
+    print(f"  {label}: mean {err.mean():.5f}  max {err.max():.5f}")
+    if arm:
+        print(f"      arm     (rad) mean {err[..., arm].mean():.5f}"
+              f" p99 {np.percentile(err[..., arm], 99):.5f} max {err[..., arm].max():.5f}")
+    if grip:
+        flips = int(np.sum(np.sign(a[..., grip]) != np.sign(b[..., grip])))
+        n = a[..., grip].size
+        print(f"      gripper (N.m) mean {err[..., grip].mean():.5f}"
+              f" p99 {np.percentile(err[..., grip], 99):.5f} max {err[..., grip].max():.5f}"
+              f"  sign flips {flips}/{n} = {flips / n * 100:.2f}%")
+    return float(err.max())
 
 
 def resolve_cameras(cfg: ACTConfig, fallback: Sequence[str]) -> List[str]:

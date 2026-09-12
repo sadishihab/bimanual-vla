@@ -32,7 +32,36 @@ import numpy as np
 import openvino as ov
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from act_io import DEFAULT_CAMERAS, STATE_KEY  # noqa: E402
+from act_io import DEFAULT_CAMERAS, GRIPPER_CHANNELS, STATE_KEY  # noqa: E402
+
+
+def action_head_nodes(model) -> list:
+    """The action head's MatMul, by the name NNCF knows it under.
+
+    NNCF matches against OpenVINO *friendly* names, not the generated
+    ``MatMul_2768`` style ones, and for a model that came through the PyTorch
+    frontend the friendly name carries the module path:
+    ``__module.model.action_head/aten::linear/MatMul``.  That is worth preferring
+    -- it is stable across conversions in a way an index is not.
+
+    Located by module path first, falling back to walking back from the output to
+    the first MatMul if the naming ever changes.  Keeping this one matmul in FP
+    costs almost nothing -- it is the smallest projection in the model -- and it is
+    the layer whose precision lands directly on the action, so it is the obvious
+    first thing to exclude when INT8 hurts accuracy.
+    """
+    named = [op.get_friendly_name() for op in model.get_ordered_ops()
+             if op.get_type_name() == "MatMul" and "action_head" in op.get_friendly_name()]
+    if named:
+        return named
+    node = model.outputs[0].get_node()
+    for _ in range(12):
+        if node.get_type_name() == "MatMul":
+            return [node.get_friendly_name()]
+        if node.get_input_size() == 0:
+            break
+        node = node.input_value(0).get_node()
+    return []
 
 
 def dataset_frames(root: pathlib.Path, repo_id: str, cameras, needed: int, batch: int):
@@ -85,6 +114,11 @@ def main() -> None:
     parser.add_argument("--preset", choices=("performance", "mixed"), default="mixed",
                         help="'mixed' keeps activations asymmetric, which suits the "
                              "signed action and torque channels")
+    parser.add_argument("--keep-head-fp32", action="store_true",
+                        help="exclude the action head's matmul from quantization. Measured "
+                             "on the 44k-step checkpoint this buys almost nothing -- max "
+                             "gripper error 1.2184 against 1.2190 -- so it is off by "
+                             "default; the flag is here to reproduce that comparison")
     args = parser.parse_args()
 
     import nncf
@@ -128,6 +162,15 @@ def main() -> None:
     calib, held_out = frames[:args.subset_size], frames[args.subset_size:]
     print(f"  preset         : {args.preset}, model_type=TRANSFORMER")
 
+    ignored = None
+    if args.keep_head_fp32:
+        head = action_head_nodes(model)
+        if head:
+            ignored = nncf.IgnoredScope(names=head)
+            print(f"  kept in FP     : {', '.join(head)}")
+        else:
+            print("  action head not located; quantizing the whole graph")
+
     t0 = time.time()
     quantized = nncf.quantize(
         model,
@@ -136,6 +179,7 @@ def main() -> None:
         preset=(nncf.QuantizationPreset.MIXED if args.preset == "mixed"
                 else nncf.QuantizationPreset.PERFORMANCE),
         model_type=nncf.ModelType.TRANSFORMER,
+        ignored_scope=ignored,
     )
     print(f"  quantized in   : {time.time() - t0:.0f} s")
 
@@ -150,15 +194,30 @@ def main() -> None:
     if held_out:
         fp32 = core.compile_model(model, "CPU")
         int8 = core.compile_model(quantized, "CPU")
-        diffs, rels = [], []
+        a_all, b_all = [], []
         for item in held_out:
-            a = fp32(item)[fp32.output(0)]
-            b = int8(item)[int8.output(0)]
-            diffs.append(float(np.abs(a - b).max()))
-            rels.append(float(np.abs(a - b).max() / (np.abs(a).max() + 1e-12)))
-        print(f"\ndivergence from FP32 over {len(held_out)} held-out frames:")
-        print(f"  max abs  : {max(diffs):.4f}   mean abs : {float(np.mean(diffs)):.4f}")
-        print(f"  max rel  : {max(rels) * 100:.2f} %  mean rel : {float(np.mean(rels)) * 100:.2f} %")
+            a_all.append(fp32(item)[fp32.output(0)])
+            b_all.append(int8(item)[int8.output(0)])
+        a, b = np.concatenate(a_all), np.concatenate(b_all)   # (N, chunk, dim)
+        err = np.abs(a - b)
+        dim = a.shape[-1]
+        grip = [c for c in GRIPPER_CHANNELS if c < dim]
+        arm = [c for c in range(dim) if c not in grip]
+        print(f"\ndivergence from FP32 over {len(held_out)} held-out frames"
+              f" ({a.shape[0]} x {a.shape[1]} steps):")
+        print(f"  all channels      : mean {err.mean():.4f}  max {err.max():.4f}")
+        if arm:
+            print(f"  arm      (rad)    : mean {err[..., arm].mean():.4f}"
+                  f"  max {err[..., arm].max():.4f}"
+                  f"   over a range of {a[..., arm].min():+.2f}..{a[..., arm].max():+.2f}")
+        if grip:
+            print(f"  gripper  (N.m)    : mean {err[..., grip].mean():.4f}"
+                  f"  max {err[..., grip].max():.4f}"
+                  f"   over a range of {a[..., grip].min():+.2f}..{a[..., grip].max():+.2f}")
+            span = float(a[..., grip].max() - a[..., grip].min())
+            worst = float(err[..., grip].max())
+            print(f"  the gripper channels span {span:.2f} N.m, so the worst case is"
+                  f" {worst / span * 100:.0f}% of their full range")
         if not have_dataset:
             print("  (calibrated on noise -- not indicative of the trained policy)")
 

@@ -21,16 +21,17 @@ several of the design decisions below exist only because a measurement forced th
 | In-air handover feasibility | **measured** — and ruled out |
 | Full-task success, 4 props x 10 seeds | **measured**: 24/40 props, 0/10 complete settings |
 | Demonstration dataset | **built**: 134 episodes, 47,092 frames |
-| ACT training | **not run.** Notebook written and its code path smoke-tested; no checkpoint exists |
-| OpenVINO FP32/FP16/INT8 conversion | **measured** with randomly initialized weights |
+| ACT training | **run**: 44,000 steps, final loss 0.09 (L1 0.09) |
+| OpenVINO FP32/FP16/INT8 conversion | **measured** on the trained checkpoint, against real frames |
+| INT8 / FP16 accuracy | **measured**: INT8 usable with care, **FP16 is not** |
 | OpenVINO CPU latency | **measured** on a Broadwell i7-5500U |
 | OpenVINO GPU / NPU latency | **not measured.** No such device was available — see [Intel hardware](#intel-hardware-mapping) |
 
-The single most important caveat: **ACT was never trained.** No checkpoint exists, so
-the OpenVINO pipeline was developed and tested against the ACT architecture with
-random weights. That makes every latency figure below valid — latency does not
-depend on weight values — and every *accuracy* figure meaningless, which is stated
-again where those appear.
+The caveat that remains: **no closed-loop evaluation.** The policy trains and
+converts, and its numerical fidelity through quantization is measured, but nothing
+here puts it back in the scene to see whether it sets the table. Latency on Intel
+GPU and NPU is also unmeasured, for the reason in
+[Intel hardware](#intel-hardware-mapping).
 
 ## Architecture
 
@@ -370,10 +371,10 @@ LeRobot schema records the distinction, so the dataset card does.
 
 ## ACT training setup
 
-**Not run.** `notebooks/train_act_kaggle.ipynb` is written and its full code path was
-smoke-tested locally on CPU (batch 2, two steps — dataset load, `delta_timestamps`,
-`make_policy`, `make_pre_post_processors`, forward, and a checkpoint save/resume round
-trip). No GPU here can train it.
+Trained to **44,000 steps, final loss 0.09 (L1 0.09)** — the KL term has collapsed to
+near zero, which is the usual end state for ACT's VAE on a dataset this size. The
+checkpoint is `checkpoints/step_0044000` (gitignored: 207 MB of weights plus 413 MB of
+optimizer state). Trained on Kaggle with `notebooks/train_act_kaggle.ipynb`.
 
 | | |
 |---|---|
@@ -410,14 +411,42 @@ near-categorical target.
 
 ## OpenVINO conversion and quantization
 
-Written against the ACT architecture from lerobot 0.4.4 and tested with **randomly
-initialized weights**, because no trained checkpoint exists.
+Measured on the trained checkpoint, against **real dataset frames**.
 
-| precision | size | parity vs torch |
-|---|---|---|
-| FP32 | 131.2 MiB | max abs diff **1.0e-06** |
-| FP16 | 66.0 MiB | max abs diff **1.0e-03** |
-| INT8 | **37.8 MiB** (3.47× smaller) | — |
+| precision | size | mean abs err | arm (rad) | gripper (N·m) | gripper sign flips |
+|---|---|---|---|---|---|
+| FP32 | 131.3 MiB | 0.00000 | max 0.00000 | max 0.00001 | 0.00% |
+| FP16 | 66.1 MiB | **0.14223** | p99 1.13, max 2.35 | max 1.88 | **14.94%** |
+| INT8 | **38.0 MiB** (3.46× smaller) | 0.0161 | p99 0.137, max 0.58 | max 1.22 | **0.92%** |
+
+A *sign flip* on a gripper channel turns close into open, which is the metric that
+decides whether behaviour survives; a mean hides it entirely.
+
+**Ship FP32. INT8 is defensible with a closed-loop check** — the arm is good to
+~0.9° mean and 7.8° at p99, but just under 1% of gripper commands invert, and a
+grasp that inverts once mid-carry drops the prop. **FP16 must not be deployed on
+this model**: 15% of gripper commands invert.
+
+Three findings behind that table, each of which cost a measurement to establish:
+
+**FP16's error is not a rounding cost.** Rounding the network weights through fp16
+*in PyTorch* costs a max of 0.0056, and the folded normalization constants 0.0054 —
+but the compressed IR is off by 2.35, three hundred times more. It is not execution
+precision (the CPU plugin reports f32 for all three, and forcing it changes
+nothing), not overflow (no constant became non-finite or was zeroed), and not a bug
+in this converter (compressing a freshly read FP32 IR gives the identical error).
+What remains is inside OpenVINO's compression pass, and that was not chased further.
+
+**Parity must be checked on real frames.** The original check used one synthetic
+uniform-noise frame, where the FP16 IR looked fine at 1.2e-03. On real frames the
+same IR is off by 1.9e+00. Uniform images sit far outside the training distribution
+and the network answers them from a flat part of its response, so a badly wrong
+precision can look exact there. This nearly shipped.
+
+**Keeping the action head in FP does not help.** The obvious fix when INT8 hurts
+accuracy is to exclude the output head. Measured, it buys 1.2184 against 1.2190 —
+nothing. The error originates upstream in the backbone and transformer; the head
+just passes it through.
 
 Two decisions shape the IR:
 
@@ -435,16 +464,13 @@ the NPU plugin rejects dynamic shapes outright, NNCF cannot size calibration ten
 against them, and the traced graph was only ever valid at its traced shapes — ACT
 iterates over its camera list and position embeddings in Python.
 
-INT8 is calibrated on real frames sampled evenly across all 47,092 recorded frames
-(`np.linspace`, not the first N, which would come from one episode of one seed), fed
-raw because the graph normalizes internally — pre-normalized calibration data would set
-every activation range against the wrong input scale. `model_type=TRANSFORMER` is
-passed deliberately: it keeps the quantization-sensitive parts of attention out of
-INT8.
-
-The INT8-vs-FP32 divergence the script reports (13–15% relative) was measured on random
-weights and **says nothing about the trained policy**. Re-run `quantize.py` against a
-real checkpoint before trusting INT8 in the loop.
+INT8 is calibrated on 300 real frames sampled evenly across all 47,092 recorded
+frames (`np.linspace`, not the first N, which would come from one episode of one
+seed), fed raw because the graph normalizes internally — pre-normalized calibration
+data would set every activation range against the wrong input scale.
+`model_type=TRANSFORMER` is passed deliberately: it keeps the quantization-sensitive
+parts of attention out of INT8. Divergence is reported on 32 frames held out of the
+calibration set.
 
 ### Latency
 
@@ -453,9 +479,9 @@ chunk 100, 50 timed iterations after 5 warmup.
 
 | device | precision | size MiB | compile s | mean ms | p50 ms | p95 ms | fps | nireq |
 |---|---|---|---|---|---|---|---|---|
-| CPU | fp32 | 131.2 | 0.70 | 159.07 | 152.63 | **181.94** | 7.04 | 4 |
-| CPU | fp16 | 66.0 | 0.63 | 164.81 | 158.35 | **184.97** | 6.81 | 4 |
-| CPU | int8 | 37.8 | 1.11 | 169.79 | 166.69 | **180.55** | 6.53 | 4 |
+| CPU | fp32 | 131.3 | 0.76 | 156.38 | 150.47 | **182.69** | 6.93 | 4 |
+| CPU | fp16 | 66.1 | 0.74 | 163.67 | 158.32 | **182.51** | 6.70 | 4 |
+| CPU | int8 | 38.0 | 1.23 | 172.75 | 166.72 | **199.26** | 6.59 | 4 |
 | GPU | — | — | — | — | — | — | — | not present |
 | NPU | — | — | — | — | — | — | — | not present |
 
@@ -463,9 +489,9 @@ Latency is reported as mean, p50 **and p95** because the tail is what breaks a c
 loop and a mean hides it. Throughput is measured separately with the plugin's own
 optimal in-flight request count.
 
-**INT8 is 3.47× smaller and no faster on this CPU.** That is the correct result on this
-part, not a bug: Broadwell has **no VNNI**, so INT8 dot products get no hardware path
-and the extra quantize/dequantize nodes cost about what the narrower arithmetic saves.
+**INT8 is 3.46× smaller and slightly *slower* on this CPU.** That is the correct
+result on this part, not a bug: Broadwell has **no VNNI**, so INT8 dot products get
+no hardware path and the quantize/dequantize nodes are pure overhead.
 
 All three precisions miss the **40 ms** a 25 Hz control loop allows — the rate the
 demonstrations were recorded at — by more than 4×. `benchmark.py` checks that
@@ -541,9 +567,11 @@ convert, quantize and benchmark. See `notebooks/README.md` for training and
 
 ## Limitations
 
-- **ACT is untrained.** Every accuracy number involving the policy is a placeholder.
-- **No closed-loop evaluation.** Nothing here runs a policy back in the scene; the
-  dataset and the IR are the deliverables.
+- **No closed-loop evaluation.** Nothing here runs the trained policy back in the
+  scene, so whether it actually sets the table is unknown. Numerical fidelity through
+  quantization is measured; task success is not.
+- **FP16 is unusable on this model** and the cause inside OpenVINO's compression pass
+  was not identified.
 - **0/10 complete settings.** The expert places 60% of props; no seed in the sweep
   completes all four. Individual placements are accurate (1.6 mm median), so the gap
   is reliability, not precision.
