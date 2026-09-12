@@ -24,14 +24,14 @@ several of the design decisions below exist only because a measurement forced th
 | ACT training | **run**: 44,000 steps, final loss 0.09 (L1 0.09) |
 | OpenVINO FP32/FP16/INT8 conversion | **measured** on the trained checkpoint, against real frames |
 | INT8 / FP16 accuracy | **measured**: INT8 usable with care, **FP16 is not** |
+| Closed-loop policy success | **measured**: 3/40 props (2 earned) against the expert's 24/40 |
 | OpenVINO CPU latency | **measured** on a Broadwell i7-5500U |
 | OpenVINO GPU / NPU latency | **not measured.** No such device was available — see [Intel hardware](#intel-hardware-mapping) |
 
-The caveat that remains: **no closed-loop evaluation.** The policy trains and
-converts, and its numerical fidelity through quantization is measured, but nothing
-here puts it back in the scene to see whether it sets the table. Latency on Intel
-GPU and NPU is also unmeasured, for the reason in
-[Intel hardware](#intel-hardware-mapping).
+The caveat that remains: latency on Intel GPU and NPU is unmeasured, for the reason
+in [Intel hardware](#intel-hardware-mapping). The policy *is* now evaluated in
+closed loop, and it does far worse than the expert — see
+[closed-loop evaluation](#closed-loop-evaluation).
 
 ## Architecture
 
@@ -328,6 +328,65 @@ mechanism and it has no fix here: `HOLD_TORQUE` cannot go up (0.35 N·m ejects t
 spoon) and re-gripping makes it worse. It is a genuine limit of a parallel jaw that
 closes past parallel on a 12 mm bar, recorded rather than tuned around.
 
+## Closed-loop evaluation
+
+`scripts/eval_policy.py` runs the trained policy in the scene with its twelve
+outputs driving `data.ctrl` directly, in place of the scripted primitives. Scored
+by the same test as the expert sweep — within 20 mm of the slot and resting on the
+table — so the numbers are comparable.
+
+| | props placed | complete settings |
+|---|---|---|
+| scripted expert | **24/40 (60.0%)** | 0/10 |
+| ACT, 44k steps | **3/40 (7.5%)**, of which **2 earned** | 0/10 |
+
+One of the three is not a placement: on seed 3 the spoon's slot happened to land
+9.8 mm from where the spoon already lay, and the policy never touched it. Exactly
+1 of the 40 prop-slot pairs starts inside tolerance, so that artifact affects one
+cell — but it is reported separately rather than counted as a success, and the
+script now marks it.
+
+### What it actually does
+
+```
+                    plate      fork      spoon      mug
+placed (earned)       2/10      0/10       0/10     0/10
+median error        58.3 mm  135.4 mm   139.6 mm  144.8 mm
+best error          13.1 mm   27.0 mm      9.8 mm  24.4 mm
+```
+
+Over the 40 prop-outcomes: the jaws contacted a prop **11** times, lifted one clear
+of the table **5** times, moved one more than 10 mm **11** times — and **29** props
+were never moved at all. One was knocked off the table.
+
+It is not incoherent. The arms move purposefully (3–16 rad of joint travel per
+episode), reach, close, and on five occasions lift a prop clear and carry it
+part-way. But **every one of those interactions is with the plate**, bar a single
+spoon touch. The fork and the mug were never contacted in any of the ten seeds.
+
+The reason is visible in how the dataset was built, and it is not a bug in the
+evaluation:
+
+- **The policy is not task-conditioned.** ACT's inputs here are the two images and
+  the twelve joint positions. The dataset's seven task strings were recorded but ACT
+  never consumes them, so the policy cannot be told which prop to move.
+- **Every episode starts from the parked pose, and the expert always does the plate
+  first** (`PLACE_ORDER` begins with it). The plate is also the most common episode,
+  47 of 134. So from the opening observation, the demonstrated action is nearly
+  always "go for the plate."
+- **The VAE has collapsed.** Final loss 0.09 with L1 0.09 means the KL term is
+  ~0, so the latent carries nothing and ACT regresses the conditional *mean* of the
+  demonstrations rather than sampling a mode. Faced with a multi-modal target — four
+  props, two arms, handover or not — the mean is the plate behaviour.
+- **The horizon is 100 actions.** `n_action_steps` is 100, four seconds at 25 Hz, so
+  the policy commits to a four-second plan per inference. Once the plate has been
+  moved or fumbled, the state is off-distribution and nothing recovers.
+
+So the honest summary is that the policy learned the opening move of the
+demonstrations and little else. That is the expected outcome of behaviour cloning on
+134 success-only episodes with no task conditioning, and it is a data and
+conditioning problem well before it is a training-length problem.
+
 ## The dataset
 
 | | |
@@ -578,4 +637,7 @@ convert, quantize and benchmark. See `notebooks/README.md` for training and
 - **The flatware shedding is unfixed**, and is the dominant failure.
 - **GPU and NPU are unmeasured**, for the reason stated above.
 - **The demonstrations are successes only.** A policy trained on them has never seen a
-  recovery.
+  recovery, and the closed-loop evaluation shows it: nothing recovers once the state
+  leaves the demonstrated distribution.
+- **The policy is not task-conditioned**, so it cannot be directed at a prop. Adding
+  the task string as an input is the first thing to change before training again.
