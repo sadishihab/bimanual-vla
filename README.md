@@ -23,14 +23,15 @@ design decisions below exist only because a measurement forced them.
 | Demonstration dataset | **built**: 134 episodes, 47,092 frames |
 | ACT training (unconditioned) | **run**: 44,000 steps, final loss 0.09 (L1 0.09) |
 | Closed-loop policy success | **measured**: 3/40 props, of which 2 earned |
-| Language conditioning | **wired and tested, not yet trained** — variant is training now |
+| Language conditioning | **trained and evaluated**: 3/40, unchanged, and it still only touches the plate |
 | OpenVINO FP32 / FP16 / INT8 | **measured** on the trained checkpoint, against real frames |
 | OpenVINO CPU latency | **measured** on a Broadwell i7-5500U |
 | OpenVINO GPU / NPU latency | **not measured** — no such device available, see [Intel hardware](#intel-hardware-mapping) |
 
-Two things are claimed nowhere in this document: that the language-conditioned
-policy works, and that anything runs well on an Intel NPU. Neither has been
-measured, and both are marked as expectation wherever they appear.
+One thing is claimed nowhere in this document: that anything runs well on an Intel
+NPU. That has not been measured, and is marked as expectation wherever it appears.
+The language-conditioned variant *has* now been trained and evaluated, and it did
+not work — see below.
 
 ## Architecture
 
@@ -443,7 +444,8 @@ and conditioning problem well before a training-length one.
 
 ## The language-conditioned variant
 
-**Status: wired, tested, and training now. No results yet.**
+**Status: trained to 44,000 steps on the same schedule, evaluated, and it did not
+change the behaviour.**
 
 lerobot 0.4.4's ACT has **no language path** — the only matches for "language" in
 `modeling_act.py` and `configuration_act.py` are the Apache licence header, and
@@ -473,11 +475,52 @@ builds `Linear(384, 512)`, and the projection receives gradient.
   unconditioned graph is unchanged. Verified with random weights; `convert.py` detects
   the token from a conditioned checkpoint's own config.
 
-Two caveats stated up front. The token conditions the encoder feeding the decoder,
-**not the VAE posterior** (which sees cls, robot state and actions only). And
-conditioning addresses only the first of the three diagnosed causes: if the latent
-stays collapsed, multimodality *within* a prop — handover or not — will still average
-out. Whether it fixes the plate fixation is **untested until the run finishes**.
+Two caveats were stated before training, and the second one is what happened. The
+token conditions the encoder feeding the decoder, **not the VAE posterior**. And
+conditioning addresses only the first of the three diagnosed causes — so if the
+latent stays collapsed, it need not help.
+
+### Result: it did not help
+
+Because the policy is task-conditioned, the evaluation can be **directed**: one
+episode per prop, each from a fresh reset of the same layout, each given that prop's
+own task string. Identical observation, different sentence — so any change is the
+conditioning and nothing else.
+
+| | props placed | target contacted | lifted |
+|---|---|---|---|
+| unconditioned, undirected | 3/40 (2 earned) | plate 10, fork 0, spoon 1, mug 0 = **11/40** | 5/40 |
+| conditioned, directed | 3/40 (2 earned) | plate 10, fork 0, spoon 0, mug 0 = **10/40** | 5/40 |
+
+**The same 3/40, and it still only touches the plate.** In all 30 episodes where the
+instruction named the fork, the spoon or the mug, the policy went for the **plate**
+instead — 30 non-target plate contacts. The fork and the mug were never contacted in
+any of the 40 directed episodes, exactly as before. The one-contact difference is the
+unconditioned policy's accidental spoon touch, which is noise.
+
+The language path is genuinely wired — the projection takes gradient, and the same
+observation with two different task strings produces two different action chunks.
+The trained policy simply ignores it.
+
+### A hypothesis, weakly supported
+
+In the demonstrations, image and task are almost perfectly correlated: the expert
+always works in `PLACE_ORDER`, so "the plate has already been moved" *implies* "the
+fork is next". A policy can read the table state from the image and never need the
+sentence. The directed evaluation breaks that correlation by always starting
+pristine, and the image then says "plate not yet placed", which is what the policy
+acts on.
+
+Tested directly — give the fork instruction from a state where the plate episode has
+already run: on **1 of 4 seeds** the fork was then contacted (7 control steps, moved
+15.5 mm) against **0 of 4** from pristine, and that one seed is the one where the
+plate episode actually succeeded. Consistent with the shortcut, but one hit out of
+four is not evidence enough to call it established.
+
+What is established is narrower and still useful: conditioning on its own does not
+fix this, and the next thing to change is the data rather than the architecture —
+episodes that start from varied table states, so the image cannot stand in for the
+instruction.
 
 `transformers` is pinned to `>=4.57.1,<5`, which lerobot 0.4.4 declares. Not
 cosmetic: installing 5.17 here broke `import lerobot.policies` outright with a
@@ -639,8 +682,10 @@ quantize and benchmark. See `notebooks/README.md` for training and
 
 - **The evaluated policy places 3 of 40 props**, against the expert's 24. The
   diagnosis above is supported by measurement; the fix is not yet demonstrated.
-- **The language-conditioned variant is untrained.** It is wired and tested but no
-  result exists, and it addresses only one of the three diagnosed causes.
+- **Language conditioning did not work.** Trained and evaluated: the same 3/40, and
+  the policy still goes for the plate whatever it is told. The likely cause — image
+  and task being correlated in the demonstrations, so the sentence is redundant — is
+  supported by only 1 of 4 probe seeds and is not established.
 - **The demonstrations are successes only**, so the policy has never seen a recovery —
   and the closed-loop run shows exactly that: nothing recovers once the state leaves
   the demonstrated distribution.

@@ -15,14 +15,15 @@ PY=${PY:-"$HOME/.cache/lerobot-verify/venv/bin/python"}   # needs mujoco AND ler
 OUT=${1:-"$ROOT/.cache/eval"}
 if [ $# -gt 0 ]; then shift; fi
 SEEDS=${*:-"0 1 2 3 4 5 6 7 8 9"}
-CKPT=${CKPT:-"$ROOT/checkpoints/step_0044000"}
+CKPT=${CKPT:-"$ROOT/checkpoints/step_0044000_lang"}
+MODE=${MODE:-directed}
 export MUJOCO_GL=${MUJOCO_GL:-egl}
 
 mkdir -p "$OUT"
 for seed in $SEEDS; do
   # A non-zero exit just means it did not place all four, which is the point.
-  "$PY" "$ROOT/scripts/eval_policy.py" --seed "$seed" --checkpoint "$CKPT" --dump \
-    > "$OUT/eval-$seed.json" 2>&1 || true
+  "$PY" "$ROOT/scripts/eval_policy.py" --seed "$seed" --checkpoint "$CKPT" \
+    --mode "$MODE" --dump > "$OUT/eval-$seed.json" 2>&1 || true
   printf '.'
 done
 echo " wrote $OUT"
