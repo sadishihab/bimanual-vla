@@ -23,15 +23,16 @@ design decisions below exist only because a measurement forced them.
 | Demonstration dataset | **built**: 134 episodes, 47,092 frames |
 | ACT training (unconditioned) | **run**: 44,000 steps, final loss 0.09 (L1 0.09) |
 | Closed-loop policy success | **measured**: 3/40 props, of which 2 earned |
-| Language conditioning | **trained and evaluated**: 3/40, unchanged, and it still only touches the plate |
+| Language conditioning | **measured, two variants**: redirects attention (0/30 → 7/30 non-plate contacts) but does not raise task competence |
 | OpenVINO FP32 / FP16 / INT8 | **measured** on the trained checkpoint, against real frames |
 | OpenVINO CPU latency | **measured** on a Broadwell i7-5500U |
 | OpenVINO GPU / NPU latency | **not measured** — no such device available, see [Intel hardware](#intel-hardware-mapping) |
 
 One thing is claimed nowhere in this document: that anything runs well on an Intel
 NPU. That has not been measured, and is marked as expectation wherever it appears.
-The language-conditioned variant *has* now been trained and evaluated, and it did
-not work — see below.
+Two language-conditioned checkpoints have now been trained and evaluated; the second
+isolates one of three diagnosed causes and measurably changes it, without raising
+overall task success — see below.
 
 ## Architecture
 
@@ -444,8 +445,9 @@ and conditioning problem well before a training-length one.
 
 ## The language-conditioned variant
 
-**Status: trained to 44,000 steps on the same schedule, evaluated, and it did not
-change the behaviour.**
+**Status: two checkpoints trained to 44,000 steps and evaluated. The second isolates
+and confirms one of the three diagnosed causes; task competence did not follow,
+because the other two causes are untouched by it.**
 
 lerobot 0.4.4's ACT has **no language path** — the only matches for "language" in
 `modeling_act.py` and `configuration_act.py` are the Apache licence header, and
@@ -475,52 +477,86 @@ builds `Linear(384, 512)`, and the projection receives gradient.
   unconditioned graph is unchanged. Verified with random weights; `convert.py` detects
   the token from a conditioned checkpoint's own config.
 
-Two caveats were stated before training, and the second one is what happened. The
-token conditions the encoder feeding the decoder, **not the VAE posterior**. And
-conditioning addresses only the first of the three diagnosed causes — so if the
-latent stays collapsed, it need not help.
+Two caveats were stated before training v1, and both bear on why v2 redirects
+attention without raising success. The token conditions the encoder feeding the
+decoder, **not the VAE posterior**. And conditioning addresses only the first of the
+three diagnosed causes — so if the latent stays collapsed and the plate keeps its
+data advantage, redirecting attention need not translate into placing more props.
 
-### Result: it did not help
+### v1: directed evaluation, trained on the original fixed-order data
 
 Because the policy is task-conditioned, the evaluation can be **directed**: one
 episode per prop, each from a fresh reset of the same layout, each given that prop's
-own task string. Identical observation, different sentence — so any change is the
-conditioning and nothing else.
+own task string. Identical observation, different sentence — so any change in
+behaviour is the conditioning and nothing else.
 
-| | props placed | target contacted | lifted |
-|---|---|---|---|
-| unconditioned, undirected | 3/40 (2 earned) | plate 10, fork 0, spoon 1, mug 0 = **11/40** | 5/40 |
-| conditioned, directed | 3/40 (2 earned) | plate 10, fork 0, spoon 0, mug 0 = **10/40** | 5/40 |
+**The same 3/40, and it still only touched the plate.** In all 30 episodes where the
+instruction named the fork, the spoon or the mug, the policy went for the plate
+instead. The fork and the mug were never contacted in any of the 40 directed
+episodes. The language path is genuinely wired — the projection takes gradient, and
+the same observation with two different task strings produces two different action
+chunks — the trained policy simply had no reason to use it.
 
-**The same 3/40, and it still only touches the plate.** In all 30 episodes where the
-instruction named the fork, the spoon or the mug, the policy went for the **plate**
-instead — 30 non-target plate contacts. The fork and the mug were never contacted in
-any of the 40 directed episodes, exactly as before. The one-contact difference is the
-unconditioned policy's accidental spoon touch, which is noise.
+The reason was a confound, not a training failure: in the demonstrations, image and
+task are almost perfectly correlated. The expert always works in `PLACE_ORDER`, so
+"the plate has already been moved" *implies* "the fork is next" — a policy can read
+the table state from the image and never need the sentence. A weak probe supported
+this (giving the fork instruction after the plate episode had already run got 1 of 4
+seeds to contact the fork, against 0 of 4 from a pristine start) but one hit in four
+did not establish it. The controlled test was to remove the confound and re-train.
 
-The language path is genuinely wired — the projection takes gradient, and the same
-observation with two different task strings produces two different action chunks.
-The trained policy simply ignores it.
+### v2: the confound removed — a controlled experiment, not a fix attempt
 
-### A hypothesis, weakly supported
+`scripts/record_demos.py` was changed to work the four props in a **seeded random
+order per seed** rather than always plate-first (see [the dataset](#the-dataset) and
+`scripts/run_task.py --order`), and the demonstrations were re-recorded: 132
+episodes, 44,352 frames, over the same 50 seeds. Measured on the recording itself,
+this is a real de-confound and not merely a shuffle in name: best-guess accuracy of
+the target from the opening table state alone fell from **100.0%** (4 states, one per
+`PLACE_ORDER` position) to **54.5%** (15 states), against a 39.0% floor for a
+predictor that only knows how many props remain. From an empty table specifically,
+the target is close to uniform: plate 14, spoon 14, fork 8, mug 7.
 
-In the demonstrations, image and task are almost perfectly correlated: the expert
-always works in `PLACE_ORDER`, so "the plate has already been moved" *implies* "the
-fork is next". A policy can read the table state from the image and never need the
-sentence. The directed evaluation breaks that correlation by always starting
-pristine, and the image then says "plate not yet placed", which is what the policy
-acts on.
+A second ACT checkpoint was trained on this dataset, identical schedule (44,000
+steps), and evaluated with the same directed protocol.
 
-Tested directly — give the fork instruction from a state where the plate episode has
-already run: on **1 of 4 seeds** the fork was then contacted (7 control steps, moved
-15.5 mm) against **0 of 4** from pristine, and that one seed is the one where the
-plate episode actually succeeded. Consistent with the shortcut, but one hit out of
-four is not evidence enough to call it established.
+| | props placed | plate target-contact | non-plate target-contact | lifted |
+|---|---|---|---|---|
+| unconditioned, undirected | 3/40 (2 earned) | 10/10 | — | 5/40 (plate only) |
+| conditioned-v1, directed — fixed-order data | 3/40 (2 earned) | 10/10 | **0/30** | 5/40 (plate only) |
+| conditioned-v2, directed — shuffled-order data | 2/40 (1 earned, 1 started in tolerance) | **5/10** | **7/30** (fork 1, spoon 3, mug 3) | 1/40 (plate only) |
 
-What is established is narrower and still useful: conditioning on its own does not
-fix this, and the next thing to change is the data rather than the architecture —
-episodes that start from varied table states, so the image cannot stand in for the
-instruction.
+**Conditioning now measurably redirects attention.** Non-plate target contact goes
+from **0/30 to 7/30** — fork, spoon and mug are each contacted on their own
+instruction in at least one seed, which never happened before. Plate contact when
+*not* instructed to fetch the plate falls correspondingly, from 10/10 to 5/10. This
+is the first evidence in this project that the language token changes what the
+policy does, and it isolates the effect: same architecture, same schedule, the only
+difference is the training data's opening-state distribution.
+
+**Task competence did not improve, and by two measures got worse.** Placed props
+fell 3/40 → 2/40 (2 earned → 1), and lifts collapsed 5/40 → 1/40. Most of the new
+non-plate contact is a shallow touch, not a grasp: seed 2 touches plate, fork *and*
+mug in the same episode without lifting any of them; seed 5 touches plate, spoon and
+mug. The policy is now attending to the instruction enough to move toward the named
+prop, but has no comparably competent grasp sequence for anything but the plate.
+
+That is exactly what the three-cause diagnosis predicts. Removing the image-task
+confound addresses **only** the first of the three causes — it says nothing about
+the other two, which are unchanged: the plate is still 48 of 132 episodes (was 47 of
+134 — the class imbalance did not move, because shuffling the working order changes
+*when* a prop is attempted, not *whether* it succeeds, and the plate is simply the
+most reliable pick), and the VAE posterior is still not conditioned on language at
+all, so nothing here touches whether it has collapsed. A policy that can now tell
+which prop it was asked for, but was never taught a reliable grasp for three of the
+four and still regresses something close to a mean action, is expected to look
+exactly like this: broader, shallower engagement rather than a second competent
+behaviour.
+
+This is reported as one cause isolated and fixed via a controlled before/after
+experiment, not as a language-conditioning fix that "worked" or "failed" — the
+architecture change is confirmed to do what it was meant to do; the other two causes
+are why the scoreboard does not move.
 
 `transformers` is pinned to `>=4.57.1,<5`, which lerobot 0.4.4 declares. Not
 cosmetic: installing 5.17 here broke `import lerobot.policies` outright with a
@@ -682,10 +718,13 @@ quantize and benchmark. See `notebooks/README.md` for training and
 
 - **The evaluated policy places 3 of 40 props**, against the expert's 24. The
   diagnosis above is supported by measurement; the fix is not yet demonstrated.
-- **Language conditioning did not work.** Trained and evaluated: the same 3/40, and
-  the policy still goes for the plate whatever it is told. The likely cause — image
-  and task being correlated in the demonstrations, so the sentence is redundant — is
-  supported by only 1 of 4 probe seeds and is not established.
+- **Language conditioning redirects attention but has not raised task competence.**
+  Two checkpoints, same schedule: v1 (fixed-order data) never contacted a non-plate
+  target in 30 directed episodes; v2 (shuffled-order data, the image-task confound
+  removed) did so in 7/30. Placed props still fell, 3/40 → 2/40, because the other
+  two diagnosed causes — VAE collapse, and the plate's 48/132 share of the data —
+  are untouched by that change. One cause isolated and fixed, not a fix demonstrated
+  end to end.
 - **The demonstrations are successes only**, so the policy has never seen a recovery —
   and the closed-loop run shows exactly that: nothing recovers once the state leaves
   the demonstrated distribution.
