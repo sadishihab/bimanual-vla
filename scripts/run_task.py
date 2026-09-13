@@ -34,8 +34,20 @@ def main() -> None:
     parser.add_argument("--scene", type=pathlib.Path, default=SCENE)
     parser.add_argument("--tolerance", type=float, default=PLACE_TOL,
                         help="m; how close to its goal a prop must land")
+    parser.add_argument("--order", default=None,
+                        help="comma-separated prop order to work in; default lays the "
+                             "anchor first. The order decides what the table looks like "
+                             "when each prop's turn comes, which is what a policy "
+                             "trained on recordings of this sees")
     parser.add_argument("--dump", action="store_true", help="print the full report as JSON")
     args = parser.parse_args()
+
+    order = tuple(PLACE_ORDER)
+    if args.order:
+        order = tuple(x.strip() for x in args.order.split(",") if x.strip())
+        if sorted(order) != sorted(PLACE_ORDER):
+            raise SystemExit(f"--order must be a permutation of {list(PLACE_ORDER)},"
+                             f" got {list(order)}")
 
     model = load_scene(args.scene)
     data = mujoco.MjData(model)
@@ -46,6 +58,8 @@ def main() -> None:
     goal = goal_layout(model, data)
     slack = check_setting(model, goal)
     print(f"seed {args.seed}: table setting, tolerance {args.tolerance * 1000:.0f} mm")
+    if order != tuple(PLACE_ORDER):
+        print(f"  order     {' -> '.join(order)}")
     print(f"  goal      " + "  ".join(f"{n} {_fmt(goal[n])}" for n in PLACE_ORDER))
     print(f"  tightest pair {min(slack, key=slack.get)} clears by"
           f" {min(slack.values()) * 1000:.0f} mm")
@@ -65,7 +79,7 @@ def main() -> None:
     radius = {s.name: s.radius for s in PROPS}
     steps = []
     print("\n  step                     pick                            place")
-    for name in PLACE_ORDER:
+    for name in order:
         if name in blocked:
             here, there = blocked[name]
             if not here or not there:
@@ -157,6 +171,7 @@ def main() -> None:
 
     if args.dump:
         print(json.dumps({"seed": args.seed,
+                          "order": list(order),
                           "tolerance": args.tolerance,
                           "goal": {k: v.tolist() for k, v in goal.items()},
                           "blocked": {k: [list(v[0]), list(v[1])]

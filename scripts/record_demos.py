@@ -8,6 +8,18 @@ per-timestep capture is a hook on ``mujoco.mj_step``, which every one of the
 expert's legs already steps through.  So the trajectories recorded are exactly
 the trajectories the sweep measured.
 
+The props are worked in a **seeded random order** per seed, not always the anchor
+first.  That is the whole point of ``--order shuffled``: with a fixed order the table
+state predicts which prop is next, so a policy can read the table instead of the
+instruction and language conditioning buys nothing -- measured, a conditioned policy
+trained on fixed-order recordings still went for the plate in all 30 episodes where
+it was told otherwise.  Shuffling makes the set of already-placed props a random
+subset, so the remaining ones are genuinely ambiguous from the image alone and the
+task string is the only thing that says which.
+
+Each episode records the table state it opened from, so that ambiguity can be
+checked on the recording rather than assumed.
+
 An *episode* is one prop's manipulation: from the moment the pick for that prop
 begins to the moment its final place returns, the handover in the middle
 included.  A whole seed is not an episode -- no seed yet gets all four props
@@ -37,6 +49,7 @@ from PIL import Image
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import scripts.run_task as run_task  # noqa: E402
 from control.ik import ARM_JOINTS  # noqa: E402
+from control.primitives import PLACE_TOL  # noqa: E402
 
 CAMERAS = ("overhead", "front")
 RESOLUTION = 256          # px; the render cost here is a fixed per-call sync,
@@ -63,6 +76,7 @@ class Recorder:
         self.qadr = self.ctrl_of = None
         self.depth, self.tick = 0, 0
         self.episodes, self.current, self.abandoned = [], None, []
+        self.prop_bids = {}
 
     # -- lifecycle ---------------------------------------------------------
     def bind(self, model, data) -> None:
@@ -77,6 +91,10 @@ class Recorder:
                 raise ValueError(f"scene has no joint {name}")
             qadr.append(model.jnt_qposadr[jid])
         self.qadr = np.asarray(qadr)
+        from envs.task import PLACE_ORDER
+
+        self.prop_bids = {n: mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, n)
+                          for n in PLACE_ORDER}
         self.renderer = mujoco.Renderer(model, height=RESOLUTION, width=RESOLUTION)
 
     def close(self) -> None:
@@ -107,6 +125,11 @@ class Recorder:
         self.tick += 1
 
     # -- episode boundaries ------------------------------------------------
+    def opening(self) -> dict:
+        """Where every prop lies right now, so the opening table state is on record."""
+        return {n: [float(v) for v in self.data.xpos[b][:2]]
+                for n, b in self.prop_bids.items()}
+
     def begin(self, name: str) -> None:
         # A prop whose pick failed never reaches its place, so its episode never
         # ends; drop whatever it staged rather than leaving it orphaned.
@@ -116,7 +139,8 @@ class Recorder:
             shutil.rmtree(path)
         for cam in CAMERAS:
             (path / cam).mkdir(parents=True, exist_ok=True)
-        self.current = {"object": name, "dir": path, "state": [], "action": []}
+        self.current = {"object": name, "dir": path, "state": [], "action": [],
+                        "opening": self.opening()}
         self.tick = 0
 
     def end(self) -> None:
@@ -164,7 +188,19 @@ def main() -> None:
     parser.add_argument("--out", type=pathlib.Path,
                         default=pathlib.Path(__file__).resolve().parent.parent
                         / ".cache" / "demos")
+    parser.add_argument("--order", choices=("shuffled", "place"), default="shuffled",
+                        help="'shuffled' works the props in a seeded random order so "
+                             "the table state does not predict which prop is next; "
+                             "'place' keeps the anchor-first order the sweeps use")
     args = parser.parse_args()
+
+    from envs.task import PLACE_ORDER
+
+    order = list(PLACE_ORDER)
+    if args.order == "shuffled":
+        # Derived from the seed so a run is reproducible, and offset so the order is
+        # not tied to the layout the same seed produces.
+        order = list(np.random.default_rng(10_000 + args.seed).permutation(PLACE_ORDER))
 
     recorder = Recorder(args.out, args.seed)
     real_step = mujoco.mj_step
@@ -180,7 +216,8 @@ def main() -> None:
     run_task.handover = wrap(recorder, run_task.handover, "handover")
 
     argv, buf = sys.argv, io.StringIO()
-    sys.argv = ["run_task.py", "--seed", str(args.seed), "--dump"]
+    sys.argv = ["run_task.py", "--seed", str(args.seed), "--dump",
+                "--order", ",".join(order)]
     try:
         with contextlib.redirect_stdout(buf):
             run_task.main()
@@ -211,17 +248,28 @@ def main() -> None:
         np.save(ep["dir"] / "state.npy", np.stack(ep["state"]))
         np.save(ep["dir"] / "action.npy", np.stack(ep["action"]))
         handed = steps[name].get("handover") is not None
+        # Which props were already at their slots when this episode opened.  This is
+        # what a policy can read off the image, so it is what has to fail to predict
+        # the target if the task string is to carry information.
+        goal = {k: np.asarray(v) for k, v in report["goal"].items()}
+        settled_at_open = sorted(
+            k for k, xy in ep["opening"].items()
+            if float(np.linalg.norm(np.asarray(xy) - goal[k])) <= PLACE_TOL)
         (ep["dir"] / "meta.json").write_text(json.dumps({
             "seed": args.seed, "object": name, "route": route, "handover": handed,
             "frames": n, "fps": FPS, "resolution": RESOLUTION,
             "cameras": list(CAMERAS), "joints": list(JOINTS),
             "error_mm": placed["error"] * 1000.0,
             "task": task_for(name, handed),
+            "order": list(order),
+            "opening_placed": settled_at_open,
+            "opening_xy": ep["opening"],
         }, indent=2, sort_keys=True))
         kept.append(name)
         frames += n
 
     dropped += recorder.abandoned
+    print(f"seed {args.seed}: order {' -> '.join(order)}")
     print(f"seed {args.seed}: kept {len(kept)} episodes ({', '.join(kept) or '-'}),"
           f" {frames} frames; dropped {len(dropped)} ({', '.join(sorted(set(dropped))) or '-'})")
 
