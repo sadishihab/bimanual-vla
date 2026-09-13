@@ -26,8 +26,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import sys
+import time
 
 import mujoco
 import numpy as np
@@ -42,6 +44,106 @@ from envs.scene import SCENE  # noqa: E402
 import scripts.eval_policy as EP  # noqa: E402
 from match_task import match_task  # noqa: E402
 from transcribe import SpeechmaticsError, transcribe  # noqa: E402
+
+
+class _ViewerClosed(RuntimeError):
+    """Raised to unwind cleanly when the user closes the viewer window mid-episode."""
+
+
+HOLD_MAX_S = 600.0    # cap on how long the finished window is held open unattended
+
+
+def _run_with_viewer(model, data, module, renderer, qadr, task_vec, args, bids, sanity,
+                     horizon):
+    """Run the episode with a live, synced MuJoCo window, and hand back the viewer too.
+
+    ``eval_policy.run_episode`` calls ``mujoco.mj_step`` as a module attribute
+    lookup on every physics step (``mujoco.mj_step(model, data)``, not a name bound
+    at import time), which is what ``scripts/record_video.py`` already relies on to
+    hook the scripted expert's primitives without editing them.  The same trick
+    works here without touching eval_policy.py: swap ``mujoco.mj_step`` for a
+    wrapper that also syncs the viewer and paces itself to wall-clock time, run the
+    unmodified ``run_episode``, and put the real function back.
+
+    Real-time pacing matters because ``run_episode`` steps physics as fast as the
+    CPU allows -- a 20 s episode would otherwise flash past in a couple of seconds
+    of wall time, which is unwatchable and unrecordable.  Pacing sleeps by the
+    model's own timestep divided by ``--speed``, so 1.0 is real time and 0.5 is
+    half speed.
+
+    Two things about ``viewer.sync()`` on this machine shape the pacing below, and
+    both were measured, not assumed.  It costs **~21 ms a call** here (GLFW is
+    running a degraded path -- no ``libdecor-gtk``, so no native window
+    decorations, on Wayland) -- so syncing on every physics step, at the model's
+    500 Hz, would spend *ten seconds of pure render overhead per second of sim
+    time*.  A first version did exactly that and looked hung: the process was
+    genuinely alive and busy, not stuck, but 20 s of sim time took several minutes
+    of wall time, and it did not even respond to SIGINT while inside that string of
+    slow native calls.  Syncing at a fixed ~30 Hz instead -- plainly enough for a
+    screen recording -- and pacing sleeps against *cumulative* sim time rather than
+    a fixed per-step amount (so one slow sync does not compound into permanent
+    drift) brought the same episode back to within a few percent of real time.
+
+    Separately: this deliberately does **not** use ``launch_passive`` as a context
+    manager, and never calls ``viewer.close()``.  Even with sync throttled, the
+    viewer's own teardown occasionally does not return, so ``main()`` holds the
+    finished window open by hand (:func:`_hold_until_closed`) and the whole
+    process ends via ``os._exit``, which needs no cooperation from anything --
+    it ends every thread at once at the OS level.  The cost is that Python's
+    normal cleanup (flushing buffers, atexit hooks) is skipped, which is why every
+    print in this script happens before that point.
+    """
+    import mujoco.viewer
+
+    SYNC_HZ = 30.0
+
+    viewer = mujoco.viewer.launch_passive(model, data)
+    real_step = mujoco.mj_step
+    start = time.time()
+    sim_elapsed = 0.0
+    last_sync = 0.0
+
+    def paced_step(m, d, nstep=1):
+        nonlocal sim_elapsed, last_sync
+        real_step(m, d, nstep)
+        if d is not data:
+            return
+        if not viewer.is_running():
+            raise _ViewerClosed("viewer window was closed")
+        sim_elapsed += nstep * m.opt.timestep
+        now = time.time()
+        if now - last_sync >= 1.0 / SYNC_HZ:
+            viewer.sync()
+            last_sync = now
+        target = start + sim_elapsed / args.speed
+        delay = target - time.time()
+        if delay > 0:
+            time.sleep(delay)
+
+    mujoco.mj_step = paced_step
+    try:
+        out = EP.run_episode(model, data, module, renderer, qadr,
+                             task_vec=task_vec, seconds=args.seconds,
+                             horizon=horizon, bids=bids, sanity=sanity)
+    except _ViewerClosed:
+        out = None
+    finally:
+        mujoco.mj_step = real_step
+    return out, viewer
+
+
+def _hold_until_closed(viewer, speed: float, max_s: float = HOLD_MAX_S) -> None:
+    """Keep the finished episode's final frame on screen until the window is closed.
+
+    Polls rather than blocking on the viewer's own machinery, for the same reason
+    :func:`_run_with_viewer` avoids ``close()``: nothing here calls into whatever
+    native path hangs.  Capped at :data:`HOLD_MAX_S` so an unattended run still ends.
+    """
+    dt = (1.0 / 30.0) / max(speed, 1e-6)
+    deadline = time.time() + max_s
+    while viewer.is_running() and time.time() < deadline:
+        viewer.sync()
+        time.sleep(dt)
 
 
 def main() -> None:
@@ -61,7 +163,31 @@ def main() -> None:
     parser.add_argument("--seconds", type=float, default=20.0)
     parser.add_argument("--horizon", type=int, default=None)
     parser.add_argument("--dump", action="store_true")
+    parser.add_argument("--viewer", action="store_true",
+                        help="open a live, interactive MuJoCo window and play the "
+                             "episode in it in real time -- for screen recording. "
+                             "Needs a display (DISPLAY set, X/Wayland reachable) and "
+                             "MUJOCO_GL must NOT be set to egl/osmesa: measured on "
+                             "this machine, an EGL offscreen context plus a GLFW "
+                             "window in one process segfaults at teardown, after "
+                             "the episode has already finished and its result "
+                             "printed, but before the process exits cleanly.")
+    parser.add_argument("--speed", type=float, default=1.0,
+                        help="--viewer playback speed; 0.5 runs at half speed, which "
+                             "is often easier to record and narrate over")
+    parser.add_argument("--hold-seconds", type=float, default=HOLD_MAX_S,
+                        help="--viewer only: how long to keep the finished episode's "
+                             "final frame on screen before force-exiting, if the "
+                             "window is not closed first")
     args = parser.parse_args()
+    if args.viewer and args.speed <= 0:
+        raise SystemExit("--speed must be positive")
+    if args.viewer and os.environ.get("MUJOCO_GL", "").lower() in ("egl", "osmesa"):
+        raise SystemExit(
+            f"--viewer needs a live window, but MUJOCO_GL={os.environ['MUJOCO_GL']!r} "
+            "selects a headless backend. Measured on this machine, mixing that "
+            "offscreen backend with the viewer's GLFW window segfaults the process "
+            "at exit. Run with MUJOCO_GL unset (do not export it at all) instead.")
 
     if not args.audio.exists():
         raise SystemExit(f"no such file: {args.audio}")
@@ -117,10 +243,21 @@ def main() -> None:
     sanity = EP.make_sanity(stats)
     renderer = mujoco.Renderer(model, height=EP.RESOLUTION, width=EP.RESOLUTION)
     try:
-        out = EP.run_episode(model, data, module, renderer, qadr, task_vec=task_vec,
-                             seconds=args.seconds, horizon=horizon, bids=bids, sanity=sanity)
+        viewer = None
+        if args.viewer:
+            out, viewer = _run_with_viewer(model, data, module, renderer, qadr, task_vec,
+                                           args, bids, sanity, horizon)
+        else:
+            out = EP.run_episode(model, data, module, renderer, qadr, task_vec=task_vec,
+                                 seconds=args.seconds, horizon=horizon, bids=bids,
+                                 sanity=sanity)
     finally:
         renderer.close()
+
+    if out is None:
+        print("\nstopped: the viewer window was closed before the episode finished; "
+              "no result to report.")
+        os._exit(0)
 
     w = out["watch"][target]
     b = bids[target]
@@ -147,6 +284,17 @@ def main() -> None:
             "contacted": w["gripped"] > 0, "lifted": w["lifted"], "settled": settled,
             "earned": earned,
         }, indent=2, sort_keys=True, default=float))
+
+    if args.viewer and viewer is not None:
+        print(f"\nholding the final frame in the viewer window -- close it "
+              f"(or wait up to {args.hold_seconds:.0f}s) to end.")
+        _hold_until_closed(viewer, args.speed, max_s=args.hold_seconds)
+        # Not a plain return: see _run_with_viewer's docstring for why the viewer's
+        # own teardown hangs on this machine and does not even respond to SIGINT.
+        # os._exit ends every thread at the OS level, needing no cooperation from
+        # whatever is stuck, at the cost of skipping Python's normal shutdown --
+        # harmless here because every result has already been printed above.
+        os._exit(0)
 
 
 if __name__ == "__main__":
