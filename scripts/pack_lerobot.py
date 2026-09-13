@@ -35,9 +35,13 @@ def episodes(stage: pathlib.Path):
             meta_path = ep_dir / "meta.json"
             if ep_dir.is_dir() and meta_path.exists():
                 metas.append((json.loads(meta_path.read_text()), ep_dir))
-        # PLACE_ORDER is the order they were actually performed in.
-        order = {"plate": 0, "fork": 1, "spoon": 2, "mug": 3}
-        for meta, ep_dir in sorted(metas, key=lambda m: order.get(m[0]["object"], 9)):
+        # Episodes go in the order they were actually performed, which the recorder
+        # writes into each meta as "order".  Falling back to the anchor-first order
+        # keeps a recording made before that field readable.
+        default = ["plate", "fork", "spoon", "mug"]
+        worked = metas[0][0].get("order", default) if metas else default
+        rank = {name: i for i, name in enumerate(worked)}
+        for meta, ep_dir in sorted(metas, key=lambda m: rank.get(m[0]["object"], 9)):
             yield meta, ep_dir
 
 
